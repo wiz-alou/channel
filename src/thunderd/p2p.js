@@ -3,7 +3,7 @@
  * 
  * DESCRIPTION:
  * Gestionnaire de communication peer-to-peer entre nodes Thunder.
- * Permet l'échange de messages, propositions de channels, et synchronisation d'états.
+ * VERSION CORRIGÉE avec synchronisation robuste des fermetures de canaux.
  * 
  * FONCTIONNALITÉS:
  * - Connexion bidirectionnelle entre nodes
@@ -11,23 +11,14 @@
  * - Gestion des propositions de channels
  * - Propagation des paiements off-chain
  * - Synchronisation des états de channels
- * - NOUVEAU: Synchronisation automatique de fermeture de channels
+ * - CORRIGÉ: Synchronisation automatique et robuste de fermeture de channels
  * 
- * TYPES DE MESSAGES:
- * - PEER_CONNECTED: Notification de connexion
- * - CHANNEL_PROPOSAL: Proposition de channel
- * - CHANNEL_ACCEPTED: Acceptation de proposition
- * - CHANNEL_CREATED: Channel créé avec smart contract
- * - CHANNEL_FUNDED: Notification de financement
- * - PAYMENT: Paiement off-chain
- * - CHANNEL_CLOSING: Notification de fermeture
- * - CHANNEL_CLOSED: NOUVEAU - Fermeture confirmée avec sync d'état
- * 
- * ARCHITECTURE:
- * - Communication HTTP entre nodes sur ports différents
- * - Messages JSON avec timestamps et IDs
- * - Handlers pour chaque type de message
- * - Gestion des timeouts et erreurs de réseau
+ * CORRECTIONS APPORTÉES:
+ * 1. Handler CHANNEL_CLOSED amélioré avec validation stricte
+ * 2. Synchronisation d'état robuste entre nodes
+ * 3. Vérification d'éligibilité automatique pour withdraw
+ * 4. Gestion d'erreurs améliorée
+ * 5. Logging détaillé pour debug
  */
 
 const axios = require('axios');
@@ -43,6 +34,7 @@ class P2PManager {
         this.messageHistory = new Map();          // Historique des messages (évite doublons)
         
         this.setupMessageHandlers();
+        console.log(`📡 P2P Manager initialized on port ${this.port} with enhanced channel sync`);
     }
     
     // === SETUP DES HANDLERS ===
@@ -81,17 +73,18 @@ class P2PManager {
             this.handlePayment(data, fromPeer);
         });
         
-        // Fermeture de channel (ancienne version)
+        // Fermeture de channel (ancienne version - gardée pour compatibilité)
         this.messageHandlers.set('CHANNEL_CLOSING', (data, fromPeer) => {
             this.handleChannelClosing(data, fromPeer);
         });
         
-        // NOUVEAU: Fermeture de channel avec synchronisation complète
+        // CORRIGÉ: Handler amélioré pour fermeture confirmée
         this.messageHandlers.set('CHANNEL_CLOSED', (data, fromPeer) => {
             this.handleChannelClosed(data, fromPeer);
         });
         
-        console.log(`📡 P2P Manager initialized on port ${this.port} with channel closure sync`);
+        console.log(`✅ Message handlers configured: ${this.messageHandlers.size} types`);
+        console.log(`   Supported messages: ${Array.from(this.messageHandlers.keys()).join(', ')}`);
     }
     
     // === GESTION DES CONNEXIONS ===
@@ -127,7 +120,7 @@ class P2PManager {
                     fromPort: this.port,
                     nodeInfo: {
                         version: '1.0.0',
-                        capabilities: ['channels', 'payments', 'p2p']
+                        capabilities: ['channels', 'payments', 'p2p', 'channel-sync']
                     },
                     timestamp: new Date().toISOString()
                 });
@@ -264,7 +257,7 @@ class P2PManager {
     /**
      * Convertit les strings en BigInt après désérialisation
      */
-    deserializeBigInt(obj, bigIntFields = ['amount', 'balance', 'balanceA', 'balanceB']) {
+    deserializeBigInt(obj, bigIntFields = ['amount', 'balance', 'balanceA', 'balanceB', 'finalBalanceA', 'finalBalanceB']) {
         if (obj === null || obj === undefined) return obj;
         
         if (Array.isArray(obj)) {
@@ -299,17 +292,24 @@ class P2PManager {
         
         console.log(`📡 Broadcasting ${type} to ${activePeers.length} peers`);
         
+        if (activePeers.length === 0) {
+            console.log(`ℹ️  No active peers for broadcast`);
+            return [];
+        }
+        
         for (const [peerAddress, peer] of activePeers) {
             try {
                 const result = await this.sendMessage(peerAddress, type, data);
                 results.push({ peer: peerAddress, success: true, result });
+                console.log(`✅ Broadcast to ${peerAddress}: SUCCESS`);
             } catch (error) {
                 results.push({ peer: peerAddress, success: false, error: error.message });
+                console.log(`❌ Broadcast to ${peerAddress}: FAILED - ${error.message}`);
             }
         }
         
         const successCount = results.filter(r => r.success).length;
-        console.log(`📡 Broadcast complete: ${successCount}/${activePeers.length} successful`);
+        console.log(`📡 Broadcast ${type} complete: ${successCount}/${activePeers.length} successful`);
         
         return results;
     }
@@ -349,6 +349,7 @@ class P2PManager {
                 handler(data, fromPeer);
             } catch (error) {
                 console.error(`❌ Error handling ${type} from ${fromPeer}:`, error.message);
+                console.error(`   Error details:`, error);
             }
         } else {
             console.log(`⚠️  No handler for message type: ${type}`);
@@ -499,7 +500,8 @@ class P2PManager {
                     balanceB: BigInt(amount) / BigInt(2),
                     createdAt: new Date().toISOString(),
                     pendingPayments: [],
-                    proposalId: proposalId
+                    proposalId: proposalId,
+                    lastUpdate: new Date().toISOString()
                 };
                 
                 this.server.channelManager.channels.set(channelId, channelData);
@@ -555,6 +557,7 @@ class P2PManager {
                 // Met à jour l'état du channel si les deux ont financé
                 if (bothFunded && channelState === 'ACTIVE') {
                     channel.state = 'ACTIVE';
+                    channel.lastUpdate = new Date().toISOString();
                     console.log(`🎉 Channel ${channelId} is now ACTIVE locally!`);
                 }
             } else {
@@ -595,6 +598,7 @@ class P2PManager {
                         channel.nonce = nonce;
                         channel.balanceA = BigInt(balanceA);
                         channel.balanceB = BigInt(balanceB);
+                        channel.lastUpdate = new Date().toISOString();
                         
                         // Ajoute le paiement à l'historique
                         const paymentRecord = {
@@ -652,49 +656,191 @@ class P2PManager {
     }
     
     /**
-     * NOUVEAU: Gère la notification de fermeture confirmée avec synchronisation
+     * CORRIGÉ: Gère la notification de fermeture confirmée avec synchronisation robuste
      */
-    handleChannelClosed(data, fromPeer) {
-        const { channelId, channelAddress, closingBlock, finalBalanceA, finalBalanceB, nonce, closedBy } = data;
-        
-        console.log(`🔒 Received channel closure notification from ${fromPeer}`);
-        console.log(`   Channel ID: ${channelId}`);
-        console.log(`   Channel Address: ${Utils.formatAddress(channelAddress)}`);
-        console.log(`   Closed by: ${Utils.formatAddress(closedBy)}`);
-        console.log(`   Closing block: ${closingBlock}`);
-        console.log(`   Final balances: A=${Utils.formatBalance(BigInt(finalBalanceA))}, B=${Utils.formatBalance(BigInt(finalBalanceB))}`);
-        console.log(`   Nonce: ${nonce}`);
-        
+// CORRECTION DANS src/thunderd/p2p.js
+// Méthode handleChannelClosed - ligne ~400 environ
+
+/**
+ * CORRIGÉ: Gère la notification de fermeture confirmée avec synchronisation robuste des BALANCES
+ */
+handleChannelClosed(data, fromPeer) {
+    console.log(`\n🔒 ===== CHANNEL CLOSURE NOTIFICATION RECEIVED =====`);
+    console.log(`   From peer: ${fromPeer}`);
+    console.log(`   Timestamp: ${new Date().toLocaleString()}`);
+    
+    const { 
+        channelId, 
+        channelAddress, 
+        closingBlock, 
+        finalBalanceA, 
+        finalBalanceB, 
+        nonce, 
+        closedBy, 
+        partA, 
+        partB,
+        transactionHash,
+        challengePeriod = 24
+    } = data;
+    
+    console.log(`📋 Channel closure details:`);
+    console.log(`   Channel ID: ${channelId}`);
+    console.log(`   Channel Address: ${Utils.formatAddress(channelAddress)}`);
+    console.log(`   Closed by: ${Utils.formatAddress(closedBy)}`);
+    console.log(`   Participants: A=${Utils.formatAddress(partA)}, B=${Utils.formatAddress(partB)}`);
+    console.log(`   Closing block: ${closingBlock}`);
+    console.log(`   Final balances: A=${Utils.formatBalance(BigInt(finalBalanceA))}, B=${Utils.formatBalance(BigInt(finalBalanceB))}`);
+    console.log(`   Nonce: ${nonce}`);
+    console.log(`   Transaction: ${transactionHash || 'N/A'}`);
+    console.log(`   Challenge period: ${challengePeriod} blocks`);
+    
+    // === VALIDATION ET SYNCHRONISATION ===
+    
+    if (!this.server.channelManager) {
+        console.log(`❌ Channel manager not available for synchronization`);
+        return;
+    }
+    
+    const channel = this.server.channelManager.channels.get(channelId);
+    if (!channel) {
+        console.log(`⚠️  Channel ${channelId} not found locally`);
+        console.log(`   This might be expected if you weren't a participant`);
+        return;
+    }
+    
+    // Vérifie que l'utilisateur actuel est participant
+    const currentUserAddress = this.server.wallet?.address?.toLowerCase();
+    if (!currentUserAddress) {
+        console.log(`⚠️  No wallet loaded for validation`);
+        return;
+    }
+    
+    const isParticipant = currentUserAddress === partA.toLowerCase() || 
+                        currentUserAddress === partB.toLowerCase();
+    
+    if (!isParticipant) {
+        console.log(`ℹ️  Channel closure not relevant (current user not a participant)`);
+        console.log(`   Current user: ${Utils.formatAddress(currentUserAddress)}`);
+        return;
+    }
+    
+    console.log(`✅ Validation passed - user is participant`);
+    console.log(`   Current user: ${Utils.formatAddress(currentUserAddress)}`);
+    console.log(`   Participant role: ${currentUserAddress === partA.toLowerCase() ? 'Part A' : 'Part B'}`);
+    
+    // === SYNCHRONISATION D'ÉTAT LOCAL AVEC BALANCES ===
+    
+    console.log(`🔄 Synchronizing local channel state...`);
+    console.log(`   Current state: ${channel.state}`);
+    console.log(`   Current nonce: ${channel.nonce}`);
+    console.log(`   Current balances: A=${Utils.formatBalance(channel.balanceA)}, B=${Utils.formatBalance(channel.balanceB)}`);
+    
+    try {
         // Met à jour l'état local du channel
-        if (this.server.channelManager) {
-            const channel = this.server.channelManager.channels.get(channelId);
-            if (channel) {
-                console.log(`🔄 Updating local channel state from ${channel.state} to CLOSING`);
-                
-                // Synchronise l'état local avec la blockchain
-                channel.state = 'CLOSING';
-                channel.closingBlock = closingBlock;
-                channel.balanceA = BigInt(finalBalanceA);
-                channel.balanceB = BigInt(finalBalanceB);
-                channel.nonce = nonce;
-                
-                console.log(`✅ Local channel state synchronized`);
-                console.log(`   Channel is now in CLOSING state`);
-                console.log(`   Channel can be withdrawn from after challenge period`);
-                console.log(`   Use: thunder-cli withdraw (after mining 25+ blocks)`);
-            } else {
-                console.log(`⚠️  Channel ${channelId} not found locally`);
-                console.log(`   This might be expected if you weren't a participant`);
-            }
-        } else {
-            console.log(`⚠️  Channel manager not available for synchronization`);
-        }
+        const previousState = channel.state;
+        const previousBalanceA = channel.balanceA;
+        const previousBalanceB = channel.balanceB;
         
-        // Affiche des instructions pour l'utilisateur
-        console.log(`💡 Next steps:`);
-        console.log(`   1. Wait for challenge period (24 blocks)`);
-        console.log(`   2. Mine blocks: npm run mine-blocks 25`);
-        console.log(`   3. Withdraw funds: thunder-cli withdraw`);
+        // === CORRECTION CRITIQUE: Synchronisation des balances ===
+        channel.state = 'CLOSING';
+        channel.closingBlock = closingBlock;
+        channel.balanceA = BigInt(finalBalanceA);  // ← CORRECTION ICI
+        channel.balanceB = BigInt(finalBalanceB);  // ← CORRECTION ICI
+        channel.nonce = nonce;
+        channel.lastUpdate = new Date().toISOString();
+        
+        console.log(`✅ Local channel state synchronized successfully`);
+        console.log(`   State: ${previousState} → CLOSING`);
+        console.log(`   Nonce: ${channel.nonce}`);
+        console.log(`   Balance A: ${Utils.formatBalance(previousBalanceA)} → ${Utils.formatBalance(channel.balanceA)}`);
+        console.log(`   Balance B: ${Utils.formatBalance(previousBalanceB)} → ${Utils.formatBalance(channel.balanceB)}`);
+        console.log(`   Closing block: ${channel.closingBlock}`);
+        
+        // === AFFICHAGE POUR L'UTILISATEUR ACTUEL ===
+        const isCurrentUserPartA = currentUserAddress === partA.toLowerCase();
+        const userFinalBalance = isCurrentUserPartA ? channel.balanceA : channel.balanceB;
+        const userRole = isCurrentUserPartA ? 'Part A' : 'Part B';
+        
+        console.log(`\n💰 Your final balance summary:`);
+        console.log(`   Your role: ${userRole}`);
+        console.log(`   Your final balance: ${Utils.formatBalance(userFinalBalance)} THD`);
+        console.log(`   Partner's balance: ${Utils.formatBalance(isCurrentUserPartA ? channel.balanceB : channel.balanceA)} THD`);
+        console.log(`   Total channel: ${Utils.formatBalance(channel.balanceA + channel.balanceB)} THD`);
+        
+        // === VÉRIFICATION AUTOMATIQUE D'ÉLIGIBILITÉ ===
+        this.checkWithdrawEligibility(channel, challengePeriod);
+        
+    } catch (syncError) {
+        console.error(`❌ Failed to synchronize channel state:`, syncError.message);
+        console.error(`   Channel closure notification received but local sync failed`);
+    }
+    
+    console.log(`\n💡 Channel closure summary for user:`);
+    console.log(`   ✅ Blockchain closure: CONFIRMED by peer`);
+    console.log(`   🔄 Local sync: ${channel.state === 'CLOSING' ? 'SUCCESS' : 'FAILED'}`);
+    console.log(`   💰 Balance sync: ${channel.balanceA && channel.balanceB ? 'SUCCESS' : 'FAILED'}`);
+    console.log(`   🎯 Next action: Wait for challenge period, then withdraw`);
+    console.log(`   📋 Commands:`);
+    console.log(`      - Check status: thunder-cli infos`);
+    console.log(`      - Check balance: thunder-cli balance`);
+    console.log(`      - Mine blocks: npm run mine-blocks 25`);
+    console.log(`      - Withdraw: thunder-cli withdraw`);
+    
+    console.log(`===== CHANNEL CLOSURE NOTIFICATION PROCESSED =====\n`);
+}
+    
+    /**
+     * NOUVEAU: Vérification automatique d'éligibilité au withdraw
+     */
+    async checkWithdrawEligibility(channel, challengePeriod = 24) {
+        try {
+            console.log(`\n🔍 Checking withdraw eligibility...`);
+            
+            if (!this.server.blockchain) {
+                console.log(`⚠️  Blockchain not available for eligibility check`);
+                return;
+            }
+            
+            const currentBlock = await this.server.blockchain.web3.eth.getBlockNumber();
+            const currentBlockNum = Number(currentBlock);
+            const closingBlockNum = Number(channel.closingBlock);
+            const blocksRemaining = (closingBlockNum + challengePeriod) - currentBlockNum;
+            
+            console.log(`📊 Withdraw eligibility status:`);
+            console.log(`   Current block: ${currentBlockNum}`);
+            console.log(`   Closing block: ${closingBlockNum}`);
+            console.log(`   Challenge period: ${challengePeriod} blocks`);
+            console.log(`   Required block: ${closingBlockNum + challengePeriod}`);
+            console.log(`   Blocks remaining: ${blocksRemaining}`);
+            
+            if (blocksRemaining <= 0) {
+                console.log(`\n🎉 WITHDRAW AVAILABLE NOW!`);
+                console.log(`================================`);
+                console.log(`Challenge period has expired.`);
+                console.log(`You can withdraw your funds immediately.`);
+                console.log(`\n💎 Use: thunder-cli withdraw`);
+                
+                // Optionnel: Calculer le montant que l'utilisateur va recevoir
+                const currentUserAddress = this.server.wallet?.address?.toLowerCase();
+                const isPartA = currentUserAddress === channel.partA.toLowerCase();
+                const userFinalBalance = isPartA ? channel.balanceA : channel.balanceB;
+                
+                console.log(`\n💰 Your final balance: ${Utils.formatBalance(userFinalBalance)} THD`);
+                
+            } else {
+                console.log(`\n⏳ Challenge period active`);
+                console.log(`============================`);
+                console.log(`${blocksRemaining} blocks remaining until withdrawal.`);
+                console.log(`\n🔨 Speed up with: npm run mine-blocks ${blocksRemaining + 1}`);
+                console.log(`📅 Or wait naturally for ${blocksRemaining} blocks`);
+                console.log(`💎 Then use: thunder-cli withdraw`);
+            }
+            
+        } catch (error) {
+            console.error(`❌ Failed to check withdraw eligibility:`, error.message);
+            console.log(`💡 You can still try: thunder-cli withdraw`);
+            console.log(`   The command will tell you if challenge period is expired`);
+        }
     }
     
     // === UTILITAIRES ===
@@ -796,6 +942,32 @@ class P2PManager {
             totalProposals,
             messagesSent,
             uptime: process.uptime()
+        };
+    }
+    
+    /**
+     * DIAGNOSTIC: Retourne des informations détaillées pour debug
+     */
+    getDiagnosticInfo() {
+        return {
+            port: this.port,
+            peersCount: this.peers.size,
+            activePeersCount: Array.from(this.peers.values()).filter(p => p.connected).length,
+            pendingProposalsCount: this.pendingChannelProposals.size,
+            messageHistorySize: this.messageHistory.size,
+            handlerTypes: Array.from(this.messageHandlers.keys()),
+            peers: Array.from(this.peers.entries()).map(([addr, peer]) => ({
+                address: addr,
+                connected: peer.connected,
+                lastSeen: peer.lastSeen,
+                capabilities: peer.nodeInfo?.capabilities || []
+            })),
+            proposals: Array.from(this.pendingChannelProposals.values()).map(prop => ({
+                id: prop.id,
+                status: prop.status,
+                peer: prop.peer,
+                receivedAt: prop.receivedAt
+            }))
         };
     }
 }
