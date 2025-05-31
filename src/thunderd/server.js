@@ -159,38 +159,52 @@ class ThunderdServer {
         
         // === BALANCES ===
         
-        this.app.get('/balance', async (req, res) => {
-            try {
-                if (!this.wallet) {
-                    throw new Error('No wallet imported');
-                }
-                
-                const balance = await this.blockchain.getBalance();
-                const channelBalance = this.getChannelBalance();
-                
-                console.log(`Balance request for ${Utils.formatAddress(this.wallet.address)}:`);
-                console.log(`  Wallet balance: ${balance.formatted} THD`);
-                console.log(`  Channel locked: ${Utils.formatBalance(channelBalance.locked)} THD`);
-                console.log(`  Channel balance: ${Utils.formatBalance(channelBalance.balance)} THD`);
-                
-                const availableBalance = balance.balance - channelBalance.locked;
-                
-                res.json({
-                    success: true,
-                    address: balance.address,
-                    totalTHD: balance.formatted,
-                    availableTHD: Utils.formatBalance(availableBalance),
-                    channelTHD: Utils.formatBalance(channelBalance.locked),
-                    channelBalance: Utils.formatBalance(channelBalance.balance)
-                });
-            } catch (error) {
-                console.error('Balance error:', error.message);
-                res.status(400).json({
-                    success: false,
-                    error: error.message
-                });
-            }
+this.app.get('/balance', async (req, res) => {
+    try {
+        if (!this.wallet) {
+            throw new Error('No wallet imported');
+        }
+        
+        // 1. Récupère le balance BRUT du wallet (incluant les fonds lockés)
+        const walletBalance = await this.blockchain.getBalance();
+        
+        // 2. Récupère les infos des channels
+        const channelBalance = this.getChannelBalance();
+        
+        console.log(`Balance request for ${Utils.formatAddress(this.wallet.address)}:`);
+        console.log(`  Wallet balance: ${walletBalance.formatted} THD`);
+        console.log(`  Channel locked: ${Utils.formatBalance(channelBalance.locked)} THD`);
+        console.log(`  Channel balance: ${Utils.formatBalance(channelBalance.balance)} THD`);
+        
+        // ===== MODIFICATION PRINCIPALE =====
+        // LOGIQUE AUDIT: Total = balance wallet + locked
+        // Available = Total - locked
+        
+        const totalBalance = walletBalance.balance + channelBalance.locked;
+        const availableBalance = totalBalance - channelBalance.locked;
+        
+        // Alternative si ça ne marche pas:
+        // const totalBalance = walletBalance.balance;
+        // const availableBalance = walletBalance.balance - channelBalance.locked;
+        console.log(`  Total calculated: ${Utils.formatBalance(totalBalance)} THD`);
+        console.log(`  Available calculated: ${Utils.formatBalance(availableBalance)} THD`);
+        
+        res.json({
+            success: true,
+            address: walletBalance.address,
+            totalTHD: Utils.formatBalance(totalBalance),
+            availableTHD: Utils.formatBalance(availableBalance),
+            channelTHD: Utils.formatBalance(channelBalance.locked),
+            channelBalance: Utils.formatBalance(channelBalance.balance)
         });
+    } catch (error) {
+        console.error('Balance error:', error.message);
+        res.status(400).json({
+            success: false,
+            error: error.message
+        });
+    }
+});
         
         // === CONNEXIONS P2P ===
         

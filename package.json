@@ -15,7 +15,24 @@
     "mine-blocks": "npx hardhat run scripts/mine-blocks.js --network localhost",
     "build": "npm run compile",
     "start": "npm run thunderd",
-    "dev": "npm run thunderd:dev"
+    "dev": "npm run thunderd:dev",
+    "build:exe": "./build.sh",
+    "pkg:install": "npm install -g pkg"
+  },
+  "pkg": {
+    "scripts": [
+      "src/**/*.js"
+    ],
+    "assets": [
+      "artifacts/**/*",
+      "node_modules/axios/**/*"
+    ],
+    "targets": [
+      "node18-linux-x64",
+      "node18-macos-x64",
+      "node18-macos-arm64",
+      "node18-win-x64"
+    ]
   },
   "bin": {
     "thunderd": "./src/thunderd.js",
@@ -35,12 +52,12 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/username/thunder-payment-channel.git"
+    "url": "git+https://learn.zone01dakar.sn/git/alassall/payment-channel.git"
   },
   "bugs": {
-    "url": "https://github.com/username/thunder-payment-channel/issues"
+    "url": "https://learn.zone01dakar.sn/git/alassall/payment-channel/issues"
   },
-  "homepage": "https://github.com/username/thunder-payment-channel#readme",
+  "homepage": "https://learn.zone01dakar.sn/git/alassall/payment-channel#readme",
   "engines": {
     "node": ">=16.0.0",
     "npm": ">=7.0.0"
@@ -51,7 +68,7 @@
   },
   "dependencies": {
     "@openzeppelin/contracts": "^5.3.0",
-    "axios": "^1.9.0",
+    "axios": "^0.27.2",
     "commander": "^14.0.0",
     "dotenv": "^16.5.0",
     "ethers": "^6.14.1",

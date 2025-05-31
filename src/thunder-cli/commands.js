@@ -450,7 +450,7 @@ class Commands {
      */
     async closeChannel(nodeUrl) {
         try {
-            console.log('🔒 Closing payment channel...');
+            console.log('🔒 Closing test payment channel...');
             
             const response = await this.makeRequest(`${nodeUrl}/closechannel`, 'POST');
             

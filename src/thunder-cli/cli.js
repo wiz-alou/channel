@@ -1,34 +1,25 @@
 #!/usr/bin/env node
 
 /**
- * 
  * DESCRIPTION:
  * Interface en ligne de commande pour Thunder Payment Channels.
- * Gère toutes les commandes utilisateur avec le nouveau workflow P2P.
+ * Supporte DEUX syntaxes :
+ * 1. Options avec -- : thunder-cli --infos, --balance, --proposals, etc.
+ * 2. Commandes classiques : thunder-cli infos, balance, proposals, etc.
  * 
- * COMMANDES PRINCIPALES:
- * - infos: Informations sur le node
- * - importwallet: Importer un wallet
- * - balance: Voir les soldes
- * - connect: Se connecter à un peer
+ * NOUVELLES OPTIONS DISPONIBLES:
+ * --infos, --balance, --proposals, --connect, --importwallet, etc.
  * 
  * NOUVEAU WORKFLOW P2P:
  * - proposechannel: Proposer un channel à un peer
  * - acceptchannel: Accepter une proposition reçue
  * - createchannel: Créer le smart contract
  * - fundchannel: Financer sa part du channel
- * - proposals: Lister les propositions
  * 
  * PAIEMENTS:
  * - pay: Envoyer un paiement off-chain
  * - closechannel: Fermer un channel
  * - withdraw: Retirer les fonds
- * 
- * USAGE:
- * thunder-cli --port 2001 proposechannel localhost:2002 10
- * thunder-cli --port 2002 acceptchannel <proposalId>
- * thunder-cli createchannel <proposalId>
- * thunder-cli fundchannel <channelId>
  */
 
 const { Command } = require('commander');
@@ -49,7 +40,24 @@ class ThunderCLI {
             .option('--port <port>', 'Thunder node port', '2001')
             .option('--host <host>', 'Thunder node host', 'localhost');
         
-        // === COMMANDES DE BASE ===
+        // === OPTIONS AVEC -- (NOUVELLE SYNTAXE) ===
+        
+        this.program
+            .option('--infos', 'Display information about the node (port, peers, channels, proposals)')
+            .option('--balance', 'Show THD balance: total, available, locked in channels')
+            .option('--proposals', 'List all pending channel proposals (sent and received)')
+            .option('--importwallet <seedphrase>', 'Import a wallet using a seed phrase')
+            .option('--connect <address>', 'Connect to another thunder node (format: ip:port)')
+            .option('--proposechannel <peer> [amount]', 'Propose a payment channel to another peer')
+            .option('--acceptchannel <proposalId>', 'Accept a channel proposal you received')
+            .option('--createchannel <proposalId>', 'Create the smart contract from an accepted proposal')
+            .option('--fundchannel <channelId>', 'Fund your part of a created channel')
+            .option('--pay <amount>', 'Send an off-chain payment through an active channel')
+            .option('--closechannel', 'Close an active channel (submits latest state to blockchain)')
+            .option('--withdraw', 'Withdraw funds from a closed channel (after challenge period)')
+            .option('--openchannel [amount]', '⚠️ DEPRECATED: Use the new P2P workflow instead');
+        
+        // === COMMANDES CLASSIQUES (RÉTROCOMPATIBILITÉ) ===
         
         this.program
             .command('infos')
@@ -159,6 +167,59 @@ class ThunderCLI {
                 console.log('Falling back to old method for compatibility...');
                 await this.commands.openChannel(this.getNodeUrl(), amount);
             });
+        
+        // === ACTION PRINCIPALE POUR GÉRER LES OPTIONS -- ===
+        
+        this.program.action(async (options) => {
+            const nodeUrl = this.getNodeUrl();
+            
+            // Gère les options avec --
+            if (options.infos) {
+                await this.commands.infos(nodeUrl);
+            } else if (options.balance) {
+                await this.commands.balance(nodeUrl);
+            } else if (options.proposals) {
+                await this.commands.listProposals(nodeUrl);
+            } else if (options.importwallet) {
+                await this.commands.importWallet(nodeUrl, options.importwallet);
+            } else if (options.connect) {
+                await this.commands.connect(nodeUrl, options.connect);
+            } else if (options.proposechannel) {
+                // Parse "peer amount" ou juste "peer"
+                const args = options.proposechannel.split(' ');
+                const peer = args[0];
+                const amount = args[1] || '10';
+                await this.commands.proposeChannel(nodeUrl, peer, amount);
+            } else if (options.acceptchannel) {
+                await this.commands.acceptChannel(nodeUrl, options.acceptchannel);
+            } else if (options.createchannel) {
+                await this.commands.createChannel(nodeUrl, options.createchannel);
+            } else if (options.fundchannel) {
+                await this.commands.fundChannel(nodeUrl, options.fundchannel);
+            } else if (options.pay) {
+                await this.commands.pay(nodeUrl, options.pay);
+            } else if (options.closechannel) {
+                await this.commands.closeChannel(nodeUrl);
+            } else if (options.withdraw) {
+                await this.commands.withdraw(nodeUrl);
+            } else if (options.openchannel) {
+                const amount = options.openchannel === true ? '10' : options.openchannel;
+                console.log('⚠️  DEPRECATED COMMAND');
+                console.log('=====================================');
+                console.log('Please use the new P2P workflow:');
+                console.log('');
+                console.log('1. thunder-cli --proposechannel "<peer> <amount>"');
+                console.log('2. thunder-cli --acceptchannel <proposalId> (on peer)');
+                console.log('3. thunder-cli --createchannel <proposalId>');
+                console.log('4. thunder-cli --fundchannel <channelId> (both parties)');
+                console.log('');
+                console.log('Falling back to old method for compatibility...');
+                await this.commands.openChannel(nodeUrl, amount);
+            } else {
+                // Aucune option spécifiée - affiche l'aide
+                this.program.help();
+            }
+        });
     }
     
     getNodeUrl() {
@@ -167,6 +228,12 @@ class ThunderCLI {
     }
     
     run() {
+        // Si aucun argument n'est fourni, affiche l'aide
+        if (process.argv.length <= 2) {
+            this.program.help();
+            return;
+        }
+        
         this.program.parse();
     }
 }

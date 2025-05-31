@@ -11,6 +11,7 @@
  * - Gestion des propositions de channels
  * - Propagation des paiements off-chain
  * - Synchronisation des états de channels
+ * - NOUVEAU: Synchronisation automatique de fermeture de channels
  * 
  * TYPES DE MESSAGES:
  * - PEER_CONNECTED: Notification de connexion
@@ -20,6 +21,7 @@
  * - CHANNEL_FUNDED: Notification de financement
  * - PAYMENT: Paiement off-chain
  * - CHANNEL_CLOSING: Notification de fermeture
+ * - CHANNEL_CLOSED: NOUVEAU - Fermeture confirmée avec sync d'état
  * 
  * ARCHITECTURE:
  * - Communication HTTP entre nodes sur ports différents
@@ -79,12 +81,17 @@ class P2PManager {
             this.handlePayment(data, fromPeer);
         });
         
-        // Fermeture de channel
+        // Fermeture de channel (ancienne version)
         this.messageHandlers.set('CHANNEL_CLOSING', (data, fromPeer) => {
             this.handleChannelClosing(data, fromPeer);
         });
         
-        console.log(`📡 P2P Manager initialized on port ${this.port}`);
+        // NOUVEAU: Fermeture de channel avec synchronisation complète
+        this.messageHandlers.set('CHANNEL_CLOSED', (data, fromPeer) => {
+            this.handleChannelClosed(data, fromPeer);
+        });
+        
+        console.log(`📡 P2P Manager initialized on port ${this.port} with channel closure sync`);
     }
     
     // === GESTION DES CONNEXIONS ===
@@ -631,7 +638,7 @@ class P2PManager {
     }
     
     /**
-     * Gère la notification de fermeture de channel
+     * Gère la notification de fermeture de channel (ancienne version)
      */
     handleChannelClosing(data, fromPeer) {
         const { channelId, nonce, balanceA, balanceB, signature } = data;
@@ -642,6 +649,52 @@ class P2PManager {
         
         // TODO: Valider l'état de fermeture et potentiellement challenger
         console.log(`⚠️  Channel closing validation not implemented in this version`);
+    }
+    
+    /**
+     * NOUVEAU: Gère la notification de fermeture confirmée avec synchronisation
+     */
+    handleChannelClosed(data, fromPeer) {
+        const { channelId, channelAddress, closingBlock, finalBalanceA, finalBalanceB, nonce, closedBy } = data;
+        
+        console.log(`🔒 Received channel closure notification from ${fromPeer}`);
+        console.log(`   Channel ID: ${channelId}`);
+        console.log(`   Channel Address: ${Utils.formatAddress(channelAddress)}`);
+        console.log(`   Closed by: ${Utils.formatAddress(closedBy)}`);
+        console.log(`   Closing block: ${closingBlock}`);
+        console.log(`   Final balances: A=${Utils.formatBalance(BigInt(finalBalanceA))}, B=${Utils.formatBalance(BigInt(finalBalanceB))}`);
+        console.log(`   Nonce: ${nonce}`);
+        
+        // Met à jour l'état local du channel
+        if (this.server.channelManager) {
+            const channel = this.server.channelManager.channels.get(channelId);
+            if (channel) {
+                console.log(`🔄 Updating local channel state from ${channel.state} to CLOSING`);
+                
+                // Synchronise l'état local avec la blockchain
+                channel.state = 'CLOSING';
+                channel.closingBlock = closingBlock;
+                channel.balanceA = BigInt(finalBalanceA);
+                channel.balanceB = BigInt(finalBalanceB);
+                channel.nonce = nonce;
+                
+                console.log(`✅ Local channel state synchronized`);
+                console.log(`   Channel is now in CLOSING state`);
+                console.log(`   Channel can be withdrawn from after challenge period`);
+                console.log(`   Use: thunder-cli withdraw (after mining 25+ blocks)`);
+            } else {
+                console.log(`⚠️  Channel ${channelId} not found locally`);
+                console.log(`   This might be expected if you weren't a participant`);
+            }
+        } else {
+            console.log(`⚠️  Channel manager not available for synchronization`);
+        }
+        
+        // Affiche des instructions pour l'utilisateur
+        console.log(`💡 Next steps:`);
+        console.log(`   1. Wait for challenge period (24 blocks)`);
+        console.log(`   2. Mine blocks: npm run mine-blocks 25`);
+        console.log(`   3. Withdraw funds: thunder-cli withdraw`);
     }
     
     // === UTILITAIRES ===
