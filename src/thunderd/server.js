@@ -5,12 +5,6 @@
  * Serveur principal Thunder qui expose une API REST pour les payment channels.
  * VERSION MISE À JOUR COMPLÈTE avec injection P2P et synchronisation des fermetures.
  * 
- * CORRECTIONS CRITIQUES:
- * 1. Injection P2P Manager dans ChannelManager (ESSENTIEL pour sync)
- * 2. Endpoints de diagnostic pour debug
- * 3. Gestion complète des erreurs et logging
- * 4. Synchronisation P2P robuste pour fermeture des canaux
- * 5. Startup séquentiel avec vérifications
  */
 
 const express = require('express');
@@ -348,42 +342,42 @@ class ThunderdServer {
 
         // === BALANCES ===
 
+        // === BALANCES CORRIGÉES ===
+
         this.app.get('/balance', async (req, res) => {
             try {
                 if (!this.wallet) {
                     throw new Error('No wallet imported');
                 }
 
-                // 1. Récupère le balance BRUT du wallet
+                // 1. Récupère le balance BRUT du wallet (déjà diminué par les escrows)
                 const walletBalance = await this.blockchain.getBalance();
 
-                // 2. Récupère les infos des channels (corrigées)
+                // 2. Récupère les infos des channels
                 const channelBalance = this.getChannelBalance();
 
                 console.log(`Balance request for ${Utils.formatAddress(this.wallet.address)}:`);
-                console.log(`  Wallet balance: ${walletBalance.formatted} THD`);
+                console.log(`  Raw wallet balance: ${walletBalance.formatted} THD`);
                 console.log(`  Channel locked: ${Utils.formatBalance(channelBalance.locked)} THD`);
                 console.log(`  Channel balance: ${Utils.formatBalance(channelBalance.balance)} THD`);
 
-                // === CORRECTION: Calcul des balances après fermeture ===
+                // === LOGIQUE ESCROW CORRIGÉE ===
+                // Le wallet balance est déjà diminué par les fonds en escrow
+                // Donc : Total = Available + Locked
+                const availableBalance = walletBalance.balance;  // Ce que vous avez vraiment dans le wallet
+                const lockedBalance = channelBalance.locked;     // Ce qui est en escrow dans les channels
+                const totalBalance = availableBalance + lockedBalance;  // CORRECTION ICI
 
-                // LOGIQUE CORRIGÉE:
-                // - Total = Balance du wallet (qui inclut les fonds récupérés après withdraw)
-                // - Available = Total - Locked (seulement les channels ACTIVE)
-                // - Locked = Seulement les channels ACTIVE
-
-                const totalBalance = walletBalance.balance;  // Le wallet Web3 reflète la réalité
-                const availableBalance = totalBalance - channelBalance.locked;
-
+                console.log(`  Available (wallet): ${Utils.formatBalance(availableBalance)} THD`);
+                console.log(`  Locked (escrow): ${Utils.formatBalance(lockedBalance)} THD`);
                 console.log(`  Total calculated: ${Utils.formatBalance(totalBalance)} THD`);
-                console.log(`  Available calculated: ${Utils.formatBalance(availableBalance)} THD`);
 
                 res.json({
                     success: true,
                     address: walletBalance.address,
-                    totalTHD: Utils.formatBalance(totalBalance),
-                    availableTHD: Utils.formatBalance(availableBalance),
-                    channelTHD: Utils.formatBalance(channelBalance.locked),
+                    totalTHD: Utils.formatBalance(totalBalance),        // CORRIGÉ
+                    availableTHD: Utils.formatBalance(availableBalance), // CORRIGÉ  
+                    channelTHD: Utils.formatBalance(lockedBalance),      // CORRIGÉ
                     channelBalance: Utils.formatBalance(channelBalance.balance)
                 });
             } catch (error) {
