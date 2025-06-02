@@ -3,8 +3,14 @@
  * 
  * DESCRIPTION:
  * Serveur principal Thunder qui expose une API REST pour les payment channels.
- * VERSION MISE À JOUR COMPLÈTE avec injection P2P et synchronisation des fermetures.
+ * VERSION COMPLÈTE avec injection P2P, synchronisation des fermetures ET support bidirectionnel.
  * 
+ * NOUVELLES FONCTIONNALITÉS:
+ * - Support bidirectionnel complet pour les propositions de channels
+ * - Résolution robuste des peers avec mapping proposalId ↔ peerAddress
+ * - Détermination dynamique de l'acceptor selon le port du peer
+ * - Injection P2P critique pour synchronisation des fermetures
+ * - Endpoints de diagnostic avancés
  */
 
 const express = require('express');
@@ -34,7 +40,7 @@ class ThunderdServer {
         this.setupRoutes();
         this.setupSocketHandlers();
 
-        console.log(`🏗️  ThunderdServer initialized on port ${this.port}`);
+        console.log(`🏗️  ThunderdServer initialized on port ${this.port} with bidirectional support`);
     }
 
     // === MIDDLEWARE SETUP ===
@@ -69,7 +75,8 @@ class ThunderdServer {
                 status: 'OK',
                 timestamp: new Date().toISOString(),
                 port: this.port,
-                version: '1.0.0-updated'
+                version: '1.0.0-bidirectional',
+                capabilities: ['channels', 'payments', 'p2p', 'channel-sync', 'bidirectional-proposals']
             });
         });
 
@@ -90,9 +97,14 @@ class ThunderdServer {
                     injections: {
                         p2pIntoChannelManager: this.channelManager ? !!this.channelManager.p2pManager : false
                     },
+                    features: {
+                        bidirectionalProposals: true,
+                        proposalMapping: !!this.p2pManager?.proposalToPeerMap,
+                        channelSync: !!(this.channelManager && this.channelManager.p2pManager)
+                    },
                     uptime: process.uptime(),
                     memoryUsage: process.memoryUsage(),
-                    version: '1.0.0-updated'
+                    version: '1.0.0-bidirectional'
                 });
             } catch (error) {
                 console.error('Debug system error:', error);
@@ -126,7 +138,8 @@ class ThunderdServer {
                     diagnostic: diagnosticInfo,
                     p2pConnected: !!this.p2pManager,
                     peersCount: this.p2pManager ? this.p2pManager.getPeers().length : 0,
-                    walletLoaded: !!this.wallet
+                    walletLoaded: !!this.wallet,
+                    bidirectionalSupport: true
                 });
             } catch (error) {
                 console.error('Debug channels error:', error);
@@ -146,7 +159,8 @@ class ThunderdServer {
                     success: true,
                     timestamp: new Date().toISOString(),
                     p2pManager: !!this.p2pManager,
-                    diagnostic: p2pInfo
+                    diagnostic: p2pInfo,
+                    bidirectionalMappings: p2pInfo.proposalMappings || {}
                 });
             } catch (error) {
                 console.error('Debug P2P error:', error);
@@ -242,9 +256,13 @@ class ThunderdServer {
                     pendingProposals: serializedProposals,
                     blockchain: blockchainInfo,
                     wallet: this.wallet ? Utils.formatAddress(this.wallet.address) : null,
-                    version: '1.0.0-updated',
+                    version: '1.0.0-bidirectional',
                     uptime: process.uptime(),
-                    p2pSyncEnabled: !!(this.channelManager && this.channelManager.p2pManager)
+                    features: {
+                        p2pSyncEnabled: !!(this.channelManager && this.channelManager.p2pManager),
+                        bidirectionalProposals: true,
+                        proposalMappingActive: !!this.p2pManager?.proposalToPeerMap
+                    }
                 };
 
                 // === VÉRIFICATION FINALE ===
@@ -268,35 +286,6 @@ class ThunderdServer {
                 console.error('❌ /infos endpoint error:', error.message);
                 console.error('   Stack:', error.stack);
 
-                // Debug spécifique selon le type d'erreur
-                if (error.message.includes('BigInt')) {
-                    console.error('🔍 BigInt serialization error details:');
-                    console.error('   Problem: Some data contains unserialized BigInt values');
-                    console.error('   Solution: All BigInt values must be converted to strings');
-
-                    // Essaie de donner plus d'infos
-                    try {
-                        const channels = this.channelManager ? this.channelManager.getChannels() : [];
-                        console.error('   Channels data types:');
-                        channels.forEach((channel, i) => {
-                            console.error(`     Channel ${i} (${channel.id}):`);
-                            Object.entries(channel).forEach(([key, value]) => {
-                                if (typeof value === 'bigint') {
-                                    console.error(`       ${key}: BigInt(${value}) ← PROBLÈME`);
-                                }
-                            });
-                        });
-                    } catch (debugError) {
-                        console.error('   Could not debug channels:', debugError.message);
-                    }
-                } else if (error.message.includes('JSON')) {
-                    console.error('🔍 JSON serialization error');
-                    console.error('   This usually means circular references or unsupported types');
-                } else {
-                    console.error('🔍 General server error');
-                    console.error('   Check all data sources for corrupted data');
-                }
-
                 res.status(500).json({
                     success: false,
                     error: 'Internal server error',
@@ -316,19 +305,32 @@ class ThunderdServer {
                     await this.blockchain.setAccount(privateKey);
                     this.wallet = this.blockchain.currentAccount;
                 } else if (seedPhrase) {
-                    // Utilise une clé privée prédéfinie pour la démo
-                    const testPrivateKey = "0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d";
+                    // === CORRECTION: Détermine la clé selon le port du node ===
+                    let testPrivateKey;
+                    
+                    if (this.port === 2001) {
+                        testPrivateKey = "0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d";
+                    } else if (this.port === 2002) {
+                        testPrivateKey = "0x5de4111afa1a4b94908f83103eb1f1706367c2e68ca870fc3fb9a804cdab365a";
+                    } else if (this.port === 2003) {
+                        testPrivateKey = "0x7c852118294e51e653712a81e05800f419141751be58f605c371e15141b007a6";
+                    } else {
+                        // Fallback
+                        testPrivateKey = "0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d";
+                    }
+                    
                     await this.blockchain.setAccount(testPrivateKey);
                     this.wallet = this.blockchain.currentAccount;
                 } else {
                     throw new Error('No privateKey or seedPhrase provided');
                 }
 
-                console.log(`🔐 Wallet imported: ${Utils.formatAddress(this.wallet.address)}`);
+                console.log(`🔐 Wallet imported on port ${this.port}: ${Utils.formatAddress(this.wallet.address)}`);
 
                 res.json({
                     success: true,
                     address: this.wallet.address,
+                    port: this.port,
                     message: 'Wallet imported successfully'
                 });
             } catch (error) {
@@ -342,15 +344,13 @@ class ThunderdServer {
 
         // === BALANCES ===
 
-        // === BALANCES CORRIGÉES ===
-
         this.app.get('/balance', async (req, res) => {
             try {
                 if (!this.wallet) {
                     throw new Error('No wallet imported');
                 }
 
-                // 1. Récupère le balance BRUT du wallet (déjà diminué par les escrows)
+                // 1. Récupère le balance BRUT du wallet
                 const walletBalance = await this.blockchain.getBalance();
 
                 // 2. Récupère les infos des channels
@@ -362,11 +362,9 @@ class ThunderdServer {
                 console.log(`  Channel balance: ${Utils.formatBalance(channelBalance.balance)} THD`);
 
                 // === LOGIQUE ESCROW CORRIGÉE ===
-                // Le wallet balance est déjà diminué par les fonds en escrow
-                // Donc : Total = Available + Locked
-                const availableBalance = walletBalance.balance;  // Ce que vous avez vraiment dans le wallet
-                const lockedBalance = channelBalance.locked;     // Ce qui est en escrow dans les channels
-                const totalBalance = availableBalance + lockedBalance;  // CORRECTION ICI
+                const availableBalance = walletBalance.balance;
+                const lockedBalance = channelBalance.locked;
+                const totalBalance = availableBalance + lockedBalance;
 
                 console.log(`  Available (wallet): ${Utils.formatBalance(availableBalance)} THD`);
                 console.log(`  Locked (escrow): ${Utils.formatBalance(lockedBalance)} THD`);
@@ -375,9 +373,9 @@ class ThunderdServer {
                 res.json({
                     success: true,
                     address: walletBalance.address,
-                    totalTHD: Utils.formatBalance(totalBalance),        // CORRIGÉ
-                    availableTHD: Utils.formatBalance(availableBalance), // CORRIGÉ  
-                    channelTHD: Utils.formatBalance(lockedBalance),      // CORRIGÉ
+                    totalTHD: Utils.formatBalance(totalBalance),
+                    availableTHD: Utils.formatBalance(availableBalance),
+                    channelTHD: Utils.formatBalance(lockedBalance),
                     channelBalance: Utils.formatBalance(channelBalance.balance)
                 });
             } catch (error) {
@@ -404,7 +402,8 @@ class ThunderdServer {
                 res.json({
                     success: true,
                     message: `Connected to ${host}:${port}`,
-                    peer: `${host}:${port}`
+                    peer: `${host}:${port}`,
+                    bidirectionalSupport: true
                 });
             } catch (error) {
                 console.error('Connect error:', error);
@@ -415,9 +414,9 @@ class ThunderdServer {
             }
         });
 
-        // === NOUVEAU WORKFLOW P2P ===
+        // === NOUVEAU WORKFLOW P2P BIDIRECTIONNEL ===
 
-        // Proposer un channel
+        // Proposer un channel CORRIGÉ BIDIRECTIONNEL
         this.app.post('/proposechannel', async (req, res) => {
             try {
                 if (!this.wallet) {
@@ -436,8 +435,35 @@ class ThunderdServer {
 
                 const amountWei = this.blockchain.web3.utils.toWei(amount, 'ether');
 
-                // Pour la démo, utilise une adresse prédéfinie pour l'acceptor
-                const acceptorAddress = "0x3C44CdDdB6a900fa2b585dd299e03d12FA4293BC";
+                // === CORRECTION CRITIQUE: Détermine dynamiquement l'acceptor selon le port du peer ===
+                
+                console.log(`🔍 Determining acceptor for proposal...`);
+                console.log(`   Proposer (current user): ${Utils.formatAddress(this.wallet.address)}`);
+                console.log(`   Target peer: ${peerAddress}`);
+                
+                // Détermine l'acceptor selon le port du peer
+                let acceptorAddress;
+                
+                if (peerAddress.includes(':2001')) {
+                    // Si on propose à port 2001, utilise l'adresse du compte 1  
+                    acceptorAddress = "0x70997970C51812dc3A010C7d01b50e0d17dc79C8";
+                } else if (peerAddress.includes(':2002')) {
+                    // Si on propose à port 2002, utilise l'adresse du compte 2
+                    acceptorAddress = "0x3C44CdDdB6a900fa2b585dd299e03d12FA4293BC";
+                } else if (peerAddress.includes(':2003')) {
+                    // Si on propose à port 2003, utilise l'adresse du compte 3
+                    acceptorAddress = "0x90F79bf6EB2c4f870365E785982E1f101E93b906";
+                } else {
+                    // Fallback: utilise l'adresse du compte 2
+                    acceptorAddress = "0x3C44CdDdB6a900fa2b585dd299e03d12FA4293BC";
+                }
+                
+                console.log(`   Determined acceptor: ${Utils.formatAddress(acceptorAddress)}`);
+                
+                // === CORRECTION: Évite la proposition à soi-même ===
+                if (this.wallet.address.toLowerCase() === acceptorAddress.toLowerCase()) {
+                    throw new Error('Cannot propose a channel to yourself. Connect to a different peer with a different port.');
+                }
 
                 const proposal = this.channelManager.createChannelProposal(
                     this.wallet.address,
@@ -445,8 +471,16 @@ class ThunderdServer {
                     amountWei
                 );
 
+                // === CORRECTION CRITIQUE: Enregistre le mapping avant envoi ===
+                this.p2pManager.registerProposalPeer(proposal.id, peerAddress, 'outgoing');
+
+                console.log(`📤 Sending proposal ${proposal.id} to ${peerAddress}...`);
+                console.log(`   Mapping registered: ${proposal.id} → ${peerAddress} (outgoing)`);
+                
                 // Envoie la proposition via P2P
                 await this.p2pManager.sendMessage(peerAddress, 'CHANNEL_PROPOSAL', proposal);
+
+                console.log(`✅ Proposal sent successfully`);
 
                 res.json({
                     success: true,
@@ -455,7 +489,10 @@ class ThunderdServer {
                         id: proposal.id,
                         amount: amount,
                         peer: peerAddress,
-                        status: proposal.status
+                        status: proposal.status,
+                        proposer: Utils.formatAddress(proposal.proposer),
+                        acceptor: Utils.formatAddress(proposal.acceptor),
+                        bidirectional: true
                     }
                 });
             } catch (error) {
@@ -481,15 +518,31 @@ class ThunderdServer {
                 // Notifie le proposer via P2P que la proposition est acceptée
                 if (this.p2pManager) {
                     try {
-                        // Trouve le peer qui a envoyé la proposition
-                        const originalProposal = this.p2pManager.getProposal(proposalId);
-                        if (originalProposal && originalProposal.peer) {
-                            await this.p2pManager.sendMessage(originalProposal.peer, 'CHANNEL_ACCEPTED', {
+                        // === CORRECTION: Utilise d'abord le mapping bidirectionnel ===
+                        const proposalMapping = this.p2pManager.getPeerForProposal(proposalId);
+                        let targetPeer = null;
+                        
+                        if (proposalMapping) {
+                            targetPeer = proposalMapping.peer;
+                            console.log(`📋 Found peer via bidirectional mapping: ${targetPeer}`);
+                        } else {
+                            // Fallback vers l'ancienne méthode
+                            const originalProposal = this.p2pManager.getProposal(proposalId);
+                            if (originalProposal && originalProposal.peer) {
+                                targetPeer = originalProposal.peer;
+                                console.log(`📋 Found peer via P2P proposal: ${targetPeer}`);
+                            }
+                        }
+                        
+                        if (targetPeer) {
+                            await this.p2pManager.sendMessage(targetPeer, 'CHANNEL_ACCEPTED', {
                                 proposalId,
                                 acceptor: this.wallet.address,
                                 timestamp: new Date().toISOString()
                             });
                             console.log(`📤 Notified proposer about acceptance`);
+                        } else {
+                            console.error('❌ No peer found to notify about acceptance');
                         }
                     } catch (p2pError) {
                         console.error('Failed to notify proposer:', p2pError.message);
@@ -517,7 +570,7 @@ class ThunderdServer {
             }
         });
 
-        // Créer le channel à partir d'une proposition  
+        // Créer le channel à partir d'une proposition CORRIGÉ BIDIRECTIONNEL
         this.app.post('/createchannel', async (req, res) => {
             try {
                 if (!this.wallet) {
@@ -530,30 +583,41 @@ class ThunderdServer {
 
                 const channel = await this.channelManager.createChannelFromProposal(proposalId);
 
-                // Notifie les peers de la création du channel
+                // === CORRECTION CRITIQUE: Résolution robuste du peer avec mapping bidirectionnel ===
                 if (this.p2pManager) {
                     try {
-                        const p2pProposal = this.p2pManager.getProposal(proposalId);
-                        const channelProposal = this.channelManager.getProposal(proposalId);
-
-                        console.log(`🔍 Checking P2P proposals for ${proposalId}...`);
-                        console.log(`P2P Proposal:`, p2pProposal?.peer ? `Found peer: ${p2pProposal.peer}` : 'Not found');
-                        console.log(`Channel Proposal:`, channelProposal ? 'Found' : 'Not found');
-
-                        // Essaie les deux sources de peer
+                        console.log(`🔍 Looking up peer for proposal ${proposalId}...`);
+                        
+                        // Étape 1: Essaie le mapping bidirectionnel (NOUVEAU ET CRITIQUE)
+                        const proposalMapping = this.p2pManager.getPeerForProposal(proposalId);
                         let targetPeer = null;
-                        if (p2pProposal?.peer) {
-                            targetPeer = p2pProposal.peer;
+                        
+                        if (proposalMapping) {
+                            targetPeer = proposalMapping.peer;
+                            console.log(`📋 Found peer via bidirectional mapping: ${targetPeer} (${proposalMapping.direction})`);
                         } else {
-                            // Fallback: utilise le premier peer connecté
-                            const connectedPeers = this.p2pManager.getPeers();
-                            if (connectedPeers.length > 0) {
-                                targetPeer = `${connectedPeers[0].host}:${connectedPeers[0].port}`;
-                                console.log(`📡 Using fallback peer: ${targetPeer}`);
+                            console.log(`⚠️  No bidirectional mapping found for proposal ${proposalId}`);
+                            
+                            // Étape 2: Fallback vers l'ancienne méthode
+                            const p2pProposal = this.p2pManager.getProposal(proposalId);
+                            if (p2pProposal?.peer) {
+                                targetPeer = p2pProposal.peer;
+                                console.log(`📋 Found peer via P2P proposal: ${targetPeer}`);
+                            } else {
+                                console.log(`⚠️  No P2P proposal found either`);
+                                
+                                // Étape 3: Utilise le premier peer connecté
+                                const connectedPeers = this.p2pManager.getPeers();
+                                if (connectedPeers.length > 0) {
+                                    targetPeer = `${connectedPeers[0].host}:${connectedPeers[0].port}`;
+                                    console.log(`📡 Using fallback peer: ${targetPeer}`);
+                                }
                             }
                         }
 
                         if (targetPeer) {
+                            console.log(`📤 Notifying peer ${targetPeer} about channel creation...`);
+                            
                             await this.p2pManager.sendMessage(targetPeer, 'CHANNEL_CREATED', {
                                 proposalId,
                                 channelId: channel.id,
@@ -563,13 +627,30 @@ class ThunderdServer {
                                 amount: channel.amount.toString(),
                                 timestamp: new Date().toISOString()
                             });
-                            console.log(`📤 Successfully notified peer ${targetPeer} about channel creation`);
+                            
+                            console.log(`✅ Successfully notified peer about channel creation`);
                         } else {
-                            console.error('❌ No peer found to notify about channel creation');
+                            console.error('❌ CRITICAL: No peer found to notify about channel creation');
+                            console.error('   This means the other party will not know the channel was created');
+                            console.error('   Possible causes:');
+                            console.error('   1. Bidirectional mapping was not registered during proposal');
+                            console.error('   2. P2P proposal data was lost');
+                            console.error('   3. No peers are connected');
+                            console.error('   4. Peer disconnected after proposal');
+                            
+                            // Debug info
+                            console.error(`   Debug info:`);
+                            console.error(`   - Connected peers: ${this.p2pManager.getPeers().length}`);
+                            console.error(`   - Proposal mapping exists: ${!!proposalMapping}`);
+                            console.error(`   - P2P proposal exists: ${!!this.p2pManager.getProposal(proposalId)}`);
                         }
                     } catch (p2pError) {
-                        console.error('Failed to notify peer about channel creation:', p2pError.message);
+                        console.error('❌ Failed to notify peer about channel creation:', p2pError.message);
+                        console.error('   Channel was created successfully but peer notification failed');
+                        console.error('   The other party may need to manually check: thunder-cli proposals');
                     }
+                } else {
+                    console.error('❌ P2P Manager not available for notification');
                 }
 
                 res.json({
@@ -580,6 +661,13 @@ class ThunderdServer {
                         address: channel.address,
                         state: channel.state,
                         needsFunding: true
+                    },
+                    // Informations de debug pour le client
+                    debug: {
+                        proposalId: proposalId,
+                        notificationSent: !!this.p2pManager && this.p2pManager.getPeers().length > 0,
+                        peersConnected: this.p2pManager ? this.p2pManager.getPeers().length : 0,
+                        bidirectionalSupport: true
                     }
                 });
             } catch (error) {
@@ -651,7 +739,9 @@ class ThunderdServer {
 
                 res.json({
                     success: true,
-                    proposals: serializedProposals
+                    proposals: serializedProposals,
+                    bidirectionalSupport: true,
+                    count: serializedProposals.length
                 });
             } catch (error) {
                 res.status(400).json({
@@ -849,6 +939,7 @@ class ThunderdServer {
                 res.json({
                     success: true,
                     message: `Channel opened with ${amount} THD (deprecated method)`,
+                    warning: 'This method is deprecated. Use the new P2P workflow for better security.',
                     channel: {
                         id: channel.id,
                         address: channel.address,
@@ -1005,13 +1096,13 @@ class ThunderdServer {
         }
     }
 
-    // === STARTUP CRITIQUE AVEC INJECTION P2P ===
+    // === STARTUP CRITIQUE AVEC INJECTION P2P ET SUPPORT BIDIRECTIONNEL ===
 
     async start() {
         try {
             console.log('⚡ Thunder Payment Channel Node');
             console.log('================================');
-            console.log(`Version: 1.0.0-updated`);
+            console.log(`Version: 1.0.0-bidirectional`);
             console.log(`Port: ${this.port}`);
             console.log('');
 
@@ -1028,7 +1119,7 @@ class ThunderdServer {
             // === ÉTAPE 3: INITIALISATION P2P MANAGER ===
             console.log('📡 Step 3: Initializing P2P manager...');
             this.p2pManager = new P2PManager(this, this.port);
-            console.log('✅ P2P manager initialized');
+            console.log('✅ P2P manager initialized with bidirectional support');
 
             // === ÉTAPE 4: INJECTION P2P DANS CHANNEL MANAGER (CRITIQUE!!!) ===
             console.log('🔗 Step 4: Injecting P2P manager into channel manager...');
@@ -1057,8 +1148,21 @@ class ThunderdServer {
                 throw new Error('Critical: P2P Manager injection failed - synchronization broken');
             }
 
-            // === ÉTAPE 5: DÉMARRAGE DU SERVEUR ===
-            console.log('🚀 Step 5: Starting HTTP server...');
+            // === ÉTAPE 5: VÉRIFICATION SUPPORT BIDIRECTIONNEL ===
+            console.log('🔄 Step 5: Verifying bidirectional support...');
+            
+            if (this.p2pManager.proposalToPeerMap && this.p2pManager.peerToProposalsMap) {
+                console.log('✅ Bidirectional proposal mapping: ENABLED');
+                console.log('   • proposalId ↔ peerAddress mapping: ACTIVE');
+                console.log('   • Peer cleanup on disconnect: ACTIVE');
+                console.log('   • Resolution cascade: ACTIVE');
+            } else {
+                console.error('❌ CRITICAL ERROR: Bidirectional mapping NOT initialized');
+                throw new Error('Critical: Bidirectional proposal support missing');
+            }
+
+            // === ÉTAPE 6: DÉMARRAGE DU SERVEUR ===
+            console.log('🚀 Step 6: Starting HTTP server...');
             this.server.listen(this.port, () => {
                 console.log('\n🎉 Thunder Node Successfully Started!');
                 console.log('=====================================');
@@ -1072,23 +1176,33 @@ class ThunderdServer {
                 console.log(`   ✅ P2P Manager: Ready`);
                 console.log(`   ✅ P2P Injection: Success`);
                 console.log(`   ✅ Channel Sync: Enabled`);
+                console.log(`   ✅ Bidirectional Proposals: Enabled`);
+                console.log(`   ✅ Proposal Mapping: Active`);
                 console.log('');
-                console.log('💡 Ready for operations!');
-                console.log('========================');
+                console.log('💡 Ready for bidirectional operations!');
+                console.log('======================================');
+                console.log('Supported workflows:');
+                console.log('  • A → B proposals and creation ✅');
+                console.log('  • B → A proposals and creation ✅');
+                console.log('  • Automatic peer resolution ✅');
+                console.log('  • Channel closure sync ✅');
+                console.log('');
                 console.log('Next steps:');
                 console.log('  1. Import wallet: thunder-cli importwallet "<seed phrase>"');
                 console.log('  2. Connect to peer: thunder-cli connect <ip:port>');
                 console.log('  3. Propose channel: thunder-cli proposechannel <peer> <amount>');
+                console.log('  4. ANY NODE can propose to ANY OTHER NODE!');
                 console.log('');
                 console.log('🔍 Debug endpoints:');
                 console.log(`  - System info: curl http://localhost:${this.port}/debug/system`);
                 console.log(`  - Channels: curl http://localhost:${this.port}/debug/channels`);
-                console.log(`  - P2P info: curl http://localhost:${this.port}/debug/p2p`);
+                console.log(`  - P2P & mappings: curl http://localhost:${this.port}/debug/p2p`);
                 console.log('');
-                console.log('🔄 Channel closure sync test:');
-                console.log('  When any node closes a channel, all connected peers');
-                console.log('  will automatically receive the closure notification');
-                console.log('  and update their local channel state to CLOSING.');
+                console.log('🧪 Test bidirectional functionality:');
+                console.log('  • Start two nodes on different ports');
+                console.log('  • Connect them bidirectionally');
+                console.log('  • Either node can propose to the other');
+                console.log('  • Both proposals will work correctly!');
             });
 
             return true;
@@ -1114,6 +1228,11 @@ class ThunderdServer {
             console.error('   - Ensure ChannelManager.setP2PManager() method exists');
             console.error('   - Check that p2pManager property is set correctly');
             console.error('   - Verify no circular dependencies in modules');
+            console.error('');
+            console.error('🚨 If bidirectional support failed:');
+            console.error('   - Ensure P2PManager has proposalToPeerMap and peerToProposalsMap');
+            console.error('   - Check registerProposalPeer() method exists');
+            console.error('   - Verify getPeerForProposal() method exists');
 
             throw error;
         }
