@@ -307,7 +307,7 @@ class ThunderdServer {
                 } else if (seedPhrase) {
                     // === CORRECTION: Détermine la clé selon le port du node ===
                     let testPrivateKey;
-                    
+
                     if (this.port === 2001) {
                         testPrivateKey = "0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d";
                     } else if (this.port === 2002) {
@@ -318,7 +318,7 @@ class ThunderdServer {
                         // Fallback
                         testPrivateKey = "0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d";
                     }
-                    
+
                     await this.blockchain.setAccount(testPrivateKey);
                     this.wallet = this.blockchain.currentAccount;
                 } else {
@@ -436,14 +436,14 @@ class ThunderdServer {
                 const amountWei = this.blockchain.web3.utils.toWei(amount, 'ether');
 
                 // === CORRECTION CRITIQUE: Détermine dynamiquement l'acceptor selon le port du peer ===
-                
+
                 console.log(`🔍 Determining acceptor for proposal...`);
                 console.log(`   Proposer (current user): ${Utils.formatAddress(this.wallet.address)}`);
                 console.log(`   Target peer: ${peerAddress}`);
-                
+
                 // Détermine l'acceptor selon le port du peer
                 let acceptorAddress;
-                
+
                 if (peerAddress.includes(':2001')) {
                     // Si on propose à port 2001, utilise l'adresse du compte 1  
                     acceptorAddress = "0x70997970C51812dc3A010C7d01b50e0d17dc79C8";
@@ -457,9 +457,9 @@ class ThunderdServer {
                     // Fallback: utilise l'adresse du compte 2
                     acceptorAddress = "0x3C44CdDdB6a900fa2b585dd299e03d12FA4293BC";
                 }
-                
+
                 console.log(`   Determined acceptor: ${Utils.formatAddress(acceptorAddress)}`);
-                
+
                 // === CORRECTION: Évite la proposition à soi-même ===
                 if (this.wallet.address.toLowerCase() === acceptorAddress.toLowerCase()) {
                     throw new Error('Cannot propose a channel to yourself. Connect to a different peer with a different port.');
@@ -476,7 +476,7 @@ class ThunderdServer {
 
                 console.log(`📤 Sending proposal ${proposal.id} to ${peerAddress}...`);
                 console.log(`   Mapping registered: ${proposal.id} → ${peerAddress} (outgoing)`);
-                
+
                 // Envoie la proposition via P2P
                 await this.p2pManager.sendMessage(peerAddress, 'CHANNEL_PROPOSAL', proposal);
 
@@ -521,7 +521,7 @@ class ThunderdServer {
                         // === CORRECTION: Utilise d'abord le mapping bidirectionnel ===
                         const proposalMapping = this.p2pManager.getPeerForProposal(proposalId);
                         let targetPeer = null;
-                        
+
                         if (proposalMapping) {
                             targetPeer = proposalMapping.peer;
                             console.log(`📋 Found peer via bidirectional mapping: ${targetPeer}`);
@@ -533,7 +533,7 @@ class ThunderdServer {
                                 console.log(`📋 Found peer via P2P proposal: ${targetPeer}`);
                             }
                         }
-                        
+
                         if (targetPeer) {
                             await this.p2pManager.sendMessage(targetPeer, 'CHANNEL_ACCEPTED', {
                                 proposalId,
@@ -587,17 +587,17 @@ class ThunderdServer {
                 if (this.p2pManager) {
                     try {
                         console.log(`🔍 Looking up peer for proposal ${proposalId}...`);
-                        
+
                         // Étape 1: Essaie le mapping bidirectionnel (NOUVEAU ET CRITIQUE)
                         const proposalMapping = this.p2pManager.getPeerForProposal(proposalId);
                         let targetPeer = null;
-                        
+
                         if (proposalMapping) {
                             targetPeer = proposalMapping.peer;
                             console.log(`📋 Found peer via bidirectional mapping: ${targetPeer} (${proposalMapping.direction})`);
                         } else {
                             console.log(`⚠️  No bidirectional mapping found for proposal ${proposalId}`);
-                            
+
                             // Étape 2: Fallback vers l'ancienne méthode
                             const p2pProposal = this.p2pManager.getProposal(proposalId);
                             if (p2pProposal?.peer) {
@@ -605,7 +605,7 @@ class ThunderdServer {
                                 console.log(`📋 Found peer via P2P proposal: ${targetPeer}`);
                             } else {
                                 console.log(`⚠️  No P2P proposal found either`);
-                                
+
                                 // Étape 3: Utilise le premier peer connecté
                                 const connectedPeers = this.p2pManager.getPeers();
                                 if (connectedPeers.length > 0) {
@@ -617,7 +617,7 @@ class ThunderdServer {
 
                         if (targetPeer) {
                             console.log(`📤 Notifying peer ${targetPeer} about channel creation...`);
-                            
+
                             await this.p2pManager.sendMessage(targetPeer, 'CHANNEL_CREATED', {
                                 proposalId,
                                 channelId: channel.id,
@@ -627,7 +627,7 @@ class ThunderdServer {
                                 amount: channel.amount.toString(),
                                 timestamp: new Date().toISOString()
                             });
-                            
+
                             console.log(`✅ Successfully notified peer about channel creation`);
                         } else {
                             console.error('❌ CRITICAL: No peer found to notify about channel creation');
@@ -637,7 +637,7 @@ class ThunderdServer {
                             console.error('   2. P2P proposal data was lost');
                             console.error('   3. No peers are connected');
                             console.error('   4. Peer disconnected after proposal');
-                            
+
                             // Debug info
                             console.error(`   Debug info:`);
                             console.error(`   - Connected peers: ${this.p2pManager.getPeers().length}`);
@@ -815,19 +815,42 @@ class ThunderdServer {
 
         // === FERMETURE & RETRAIT (CORRIGÉ AVEC SYNC P2P) ===
 
+
         this.app.post('/closechannel', async (req, res) => {
             try {
                 const channels = this.channelManager.getChannels();
                 const activeChannel = channels.find(c => c.state === 'ACTIVE');
 
                 if (!activeChannel) {
+                    // Vérifie s'il y a des channels CLOSING
+                    const closingChannels = channels.filter(c => c.state === 'CLOSING');
+                    if (closingChannels.length > 0) {
+                        const closingChannel = closingChannels[0];
+                        return res.status(400).json({
+                            success: false,
+                            error: `Channel ${closingChannel.id} is already in CLOSING state. It was closed by the other party. Use 'thunder-cli withdraw' after the challenge period expires.`,
+                            channelState: 'CLOSING',
+                            channelId: closingChannel.id,
+                            suggestion: 'withdraw'
+                        });
+                    }
+
+                    // Vérifie s'il y a des channels CLOSED
+                    const closedChannels = channels.filter(c => c.state === 'CLOSED');
+                    if (closedChannels.length > 0) {
+                        return res.status(400).json({
+                            success: false,
+                            error: `All channels are already closed. Funds have been distributed. Check your balance.`,
+                            channelState: 'CLOSED',
+                            suggestion: 'balance'
+                        });
+                    }
+
                     throw new Error('No active channel found. Available channels: ' +
                         channels.map(c => `${c.id}(${c.state})`).join(', '));
                 }
 
                 console.log(`🔒 Closing channel ${activeChannel.id} via API...`);
-                console.log(`   P2P Manager available: ${!!this.p2pManager}`);
-                console.log(`   Channel Manager P2P reference: ${!!(this.channelManager && this.channelManager.p2pManager)}`);
 
                 const receipt = await this.channelManager.closeChannel(activeChannel.id);
 
@@ -840,10 +863,37 @@ class ThunderdServer {
                 });
             } catch (error) {
                 console.error('Close channel error:', error);
-                res.status(400).json({
-                    success: false,
-                    error: error.message
-                });
+
+                // Messages d'erreur spécifiques
+                if (error.message.includes('already CLOSING')) {
+                    res.status(400).json({
+                        success: false,
+                        error: error.message,
+                        channelState: 'CLOSING',
+                        suggestion: 'wait_and_withdraw',
+                        nextSteps: [
+                            'Wait for challenge period to expire',
+                            'Use: thunder-cli withdraw',
+                            'Or speed up: npm run mine-blocks 25'
+                        ]
+                    });
+                } else if (error.message.includes('already CLOSED')) {
+                    res.status(400).json({
+                        success: false,
+                        error: error.message,
+                        channelState: 'CLOSED',
+                        suggestion: 'check_balance',
+                        nextSteps: [
+                            'Check your balance: thunder-cli balance',
+                            'Funds should already be in your wallet'
+                        ]
+                    });
+                } else {
+                    res.status(400).json({
+                        success: false,
+                        error: error.message
+                    });
+                }
             }
         });
 
@@ -853,18 +903,32 @@ class ThunderdServer {
                 const closingChannel = channels.find(c => c.state === 'CLOSING');
 
                 if (!closingChannel) {
+                    // Vérifie s'il y a des channels déjà CLOSED
+                    const closedChannels = channels.filter(c => c.state === 'CLOSED');
+                    if (closedChannels.length > 0) {
+                        return res.status(400).json({
+                            success: false,
+                            error: `All channels are already closed and funds withdrawn. Check your balance.`,
+                            channelState: 'CLOSED',
+                            suggestion: 'balance'
+                        });
+                    }
+
                     throw new Error('No closing channel found. Available channels: ' +
                         channels.map(c => `${c.id}(${c.state})`).join(', '));
                 }
 
-                console.log(`💳 Withdrawing from channel ${closingChannel.id}...`);
+                console.log(`💳 Withdrawing from channel ${closingChannel.id} via API...`);
+                console.log(`   P2P notification will be sent automatically`);
 
                 const receipt = await this.channelManager.withdrawFromChannel(closingChannel.id);
 
                 res.json({
                     success: true,
                     message: 'Funds withdrawn successfully',
-                    transactionHash: receipt.transactionHash
+                    transactionHash: receipt.transactionHash,
+                    channelId: closingChannel.id,
+                    p2pNotified: !!(this.channelManager && this.channelManager.p2pManager)
                 });
             } catch (error) {
                 console.error('Withdraw error:', error.message);
@@ -999,6 +1063,118 @@ class ThunderdServer {
 
         const result = this.channelManager.getChannelBalance(this.wallet.address);
         return result;
+    }
+
+    handleChannelWithdrawn(data, fromPeer) {
+        console.log(`\n💳 ===== CHANNEL WITHDRAW NOTIFICATION RECEIVED =====`);
+        console.log(`   From peer: ${fromPeer}`);
+        console.log(`   Timestamp: ${new Date().toLocaleString()}`);
+
+        const {
+            channelId,
+            channelAddress,
+            withdrawnBy,
+            userRole,
+            withdrawnAmount,
+            transactionHash,
+            blockNumber,
+            partA,
+            partB,
+            finalBalanceA,
+            finalBalanceB,
+            channelNowClosed
+        } = data;
+
+        console.log(`📋 Withdraw notification details:`);
+        console.log(`   Channel ID: ${channelId}`);
+        console.log(`   Channel Address: ${Utils.formatAddress(channelAddress)}`);
+        console.log(`   Withdrawn by: ${Utils.formatAddress(withdrawnBy)} (${userRole})`);
+        console.log(`   Amount withdrawn: ${Utils.formatBalance(BigInt(withdrawnAmount))} THD`);
+        console.log(`   Transaction: ${transactionHash}`);
+        console.log(`   Block: ${blockNumber}`);
+        console.log(`   Channel now closed: ${channelNowClosed}`);
+
+        // === SYNCHRONISATION CRITIQUE ===
+
+        if (!this.server.channelManager) {
+            console.log(`❌ Channel manager not available for synchronization`);
+            return;
+        }
+
+        const channel = this.server.channelManager.channels.get(channelId);
+        if (!channel) {
+            console.log(`⚠️  Channel ${channelId} not found locally`);
+            console.log(`   This might be expected if you weren't a participant`);
+            return;
+        }
+
+        // Vérifie que l'utilisateur actuel est participant
+        const currentUserAddress = this.server.wallet?.address?.toLowerCase();
+        if (!currentUserAddress) {
+            console.log(`⚠️  No wallet loaded for validation`);
+            return;
+        }
+
+        const isParticipant = currentUserAddress === partA.toLowerCase() ||
+            currentUserAddress === partB.toLowerCase();
+
+        if (!isParticipant) {
+            console.log(`ℹ️  Withdraw notification not relevant (current user not a participant)`);
+            console.log(`   Current user: ${Utils.formatAddress(currentUserAddress)}`);
+            return;
+        }
+
+        console.log(`✅ Withdraw notification relevant - user is participant`);
+        console.log(`   Current user: ${Utils.formatAddress(currentUserAddress)}`);
+        console.log(`   Participant role: ${currentUserAddress === partA.toLowerCase() ? 'Part A' : 'Part B'}`);
+
+        // === SYNCHRONISATION D'ÉTAT VERS CLOSED ===
+
+        console.log(`🔄 Synchronizing channel to CLOSED state...`);
+        console.log(`   Current state: ${channel.state}`);
+
+        try {
+            const previousState = channel.state;
+
+            // === SYNCHRONISATION CRITIQUE VERS CLOSED ===
+            channel.state = 'CLOSED';
+            channel.balanceA = BigInt(finalBalanceA);
+            channel.balanceB = BigInt(finalBalanceB);
+            channel.lastUpdate = new Date().toISOString();
+
+            console.log(`✅ Channel state synchronized successfully`);
+            console.log(`   State: ${previousState} → CLOSED`);
+            console.log(`   Final balances: A=${Utils.formatBalance(channel.balanceA)}, B=${Utils.formatBalance(channel.balanceB)}`);
+
+            // Affiche l'information pour l'utilisateur actuel
+            const isCurrentUserPartA = currentUserAddress === partA.toLowerCase();
+            const otherWithdrew = withdrawnBy.toLowerCase() !== currentUserAddress;
+
+            if (otherWithdrew) {
+                console.log(`\n💰 Other party withdraw summary:`);
+                console.log(`   ${Utils.formatAddress(withdrawnBy)} (${userRole}) withdrew ${Utils.formatBalance(BigInt(withdrawnAmount))} THD`);
+                console.log(`   Channel is now CLOSED on blockchain`);
+
+                // Vérifie si l'utilisateur actuel peut aussi retirer
+                const userFinalBalance = isCurrentUserPartA ? channel.balanceA : channel.balanceB;
+
+                if (userFinalBalance > 0) {
+                    console.log(`\n🎯 YOU CAN NOW WITHDRAW!`);
+                    console.log(`========================`);
+                    console.log(`Your final balance: ${Utils.formatBalance(userFinalBalance)} THD`);
+                    console.log(`The channel is now CLOSED and you can withdraw immediately.`);
+                    console.log(`\n💎 Use: thunder-cli withdraw`);
+                } else {
+                    console.log(`\n📊 Your final balance: ${Utils.formatBalance(userFinalBalance)} THD (nothing to withdraw)`);
+                }
+            }
+
+        } catch (syncError) {
+            console.error(`❌ Failed to synchronize channel state:`, syncError.message);
+            console.error(`   Withdraw notification received but local sync failed`);
+        }
+
+        console.log(`===== CHANNEL WITHDRAW NOTIFICATION PROCESSED =====\n`);
     }
 
     /**
@@ -1150,7 +1326,7 @@ class ThunderdServer {
 
             // === ÉTAPE 5: VÉRIFICATION SUPPORT BIDIRECTIONNEL ===
             console.log('🔄 Step 5: Verifying bidirectional support...');
-            
+
             if (this.p2pManager.proposalToPeerMap && this.p2pManager.peerToProposalsMap) {
                 console.log('✅ Bidirectional proposal mapping: ENABLED');
                 console.log('   • proposalId ↔ peerAddress mapping: ACTIVE');
