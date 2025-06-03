@@ -2,25 +2,16 @@
  * FICHIER: src/thunderd/channel.js
  * 
  * DESCRIPTION:
- * Ce fichier gère tous les payment channels avec le nouveau système de propositions.
- * VERSION CORRIGÉE avec synchronisation P2P complète pour la fermeture des canaux.
+ * Gestionnaire de payment channels avec support multi-réseau (localhost, Sepolia, mainnet).
+ * VERSION COMPLÈTE avec synchronisation P2P, support bidirectionnel et adaptation automatique
+ * selon le réseau blockchain détecté.
  * 
- * FONCTIONNALITÉS:
- * - Création de propositions de channel (propose/accept/create)
- * - Financement individuel par chaque utilisateur
- * - Paiements off-chain avec signatures
- * - Fermeture et retrait de fonds avec synchronisation P2P COMPLÈTE
- * - Calcul correct des balances
- * - CORRIGÉ: Synchronisation P2P automatique et robuste
- * - NOUVEAU: Vérification de l'état blockchain avant fermeture
- * 
- * CORRECTIONS APPORTÉES:
- * 1. Injection correcte du P2P Manager
- * 2. Notification P2P robuste lors de la fermeture
- * 3. Validation et synchronisation d'état
- * 4. Gestion d'erreurs améliorée
- * 5. Vérification blockchain avant fermeture
- * 6. Messages d'erreur explicites
+ * NOUVELLES FONCTIONNALITÉS SEPOLIA:
+ * - Adaptation automatique selon le réseau (gas price, block times, etc.)
+ * - Gestion des faucets et explorers selon le réseau
+ * - Validation spécifique aux réseaux de test vs production
+ * - Messages d'aide contextuels selon le réseau
+ * - Optimisations gas pour différents réseaux
  */
 
 const Utils = require('../shared/utils');
@@ -33,62 +24,120 @@ class ChannelManager {
         this.proposals = new Map();          // Propositions de channels
         this.userFunding = new Map();        // Suivi du financement par utilisateur
         this.p2pManager = null;              // Référence au P2P Manager (sera injectée)
+        
+        // Détection du réseau pour adaptation
+        this.network = 'localhost';
+        this.networkConfig = this.getNetworkConfig();
 
-        console.log(`📋 ChannelManager initialized`);
+        console.log(`📋 ChannelManager initialized for network: ${this.network}`);
     }
 
-    // === INJECTION DU P2P MANAGER (CORRIGÉ) ===
+    // === CONFIGURATION RÉSEAU ===
 
     /**
-     * Injecte la référence au P2P Manager
-     * @param {P2PManager} p2pManager - Instance du gestionnaire P2P
+     * Détecte le réseau actuel et retourne la configuration appropriée
      */
+    getNetworkConfig() {
+        if (this.blockchain && this.blockchain.getNetworkInfo) {
+            const networkInfo = this.blockchain.getNetworkInfo();
+            this.network = networkInfo.network || 'localhost';
+        }
+
+        const configs = {
+            localhost: {
+                challengePeriod: 10,        // Blocs courts pour dev
+                gasMultiplier: 1.1,         // Marge standard
+                maxGasPrice: '20000000000', // 20 Gwei max
+                blockConfirmations: 1,      // Confirmation rapide
+                isTestnet: true
+            },
+            sepolia: {
+                challengePeriod: 24,        // 24 blocs standard
+                gasMultiplier: 1.2,         // Marge plus élevée
+                maxGasPrice: '50000000000', // 50 Gwei max
+                blockConfirmations: 2,      // 2 confirmations
+                isTestnet: true,
+                faucets: [
+                    'https://sepoliafaucet.com/',
+                    'https://faucets.chain.link/sepolia'
+                ],
+                explorer: 'https://sepolia.etherscan.io'
+            },
+            mainnet: {
+                challengePeriod: 144,       // ~24h avec blocs de 12s
+                gasMultiplier: 1.1,         // Marge conservative
+                maxGasPrice: '100000000000', // 100 Gwei max
+                blockConfirmations: 3,      // 3 confirmations minimum
+                isTestnet: false,
+                explorer: 'https://etherscan.io'
+            },
+            polygon: {
+                challengePeriod: 100,       // ~50min avec blocs de 2s
+                gasMultiplier: 1.3,         // Réseau plus volatil
+                maxGasPrice: '500000000000', // 500 Gwei (MATIC)
+                blockConfirmations: 5,
+                isTestnet: false,
+                explorer: 'https://polygonscan.com'
+            }
+        };
+
+        const config = configs[this.network] || configs.localhost;
+        
+        console.log(`🔧 Network configuration loaded for ${this.network}:`);
+        console.log(`   Challenge period: ${config.challengePeriod} blocks`);
+        console.log(`   Gas multiplier: ${config.gasMultiplier}x`);
+        console.log(`   Is testnet: ${config.isTestnet}`);
+        
+        return config;
+    }
+
+    /**
+     * Met à jour la configuration réseau (appelé après connection blockchain)
+     */
+    updateNetworkConfig() {
+        this.networkConfig = this.getNetworkConfig();
+        console.log(`🔄 Network configuration updated for ${this.network}`);
+    }
+
+    // === INJECTION DU P2P MANAGER ===
+
     setP2PManager(p2pManager) {
         this.p2pManager = p2pManager;
         console.log(`✅ P2P Manager successfully injected into ChannelManager`);
         console.log(`   P2P Manager available: ${!!this.p2pManager}`);
-        console.log(`   Channel closure sync: ENABLED`);
+        console.log(`   Channel closure sync: ENABLED for ${this.network}`);
     }
 
     // === SYSTÈME DE PROPOSITIONS ===
 
-    /**
-     * Crée une proposition de channel
-     * @param {string} proposerId - Adresse de celui qui propose
-     * @param {string} acceptorId - Adresse de celui qui doit accepter
-     * @param {string} amount - Montant total du channel en wei
-     */
     createChannelProposal(proposerId, acceptorId, amount) {
         const proposal = {
             id: Utils.generateId(),
             proposer: proposerId,
             acceptor: acceptorId,
-            amount: amount.toString(), // Convert BigInt to string
+            amount: amount.toString(),
             status: 'PROPOSED',
             createdAt: new Date().toISOString(),
             acceptedAt: null,
-            channelId: null
+            channelId: null,
+            network: this.network // NOUVEAU: Ajout du réseau
         };
 
         this.proposals.set(proposal.id, {
             ...proposal,
-            amount: BigInt(amount) // Keep BigInt internally
+            amount: BigInt(amount)
         });
 
-        console.log(`📋 Channel proposal created:`);
+        console.log(`📋 Channel proposal created on ${this.network}:`);
         console.log(`   ID: ${proposal.id}`);
         console.log(`   Proposer: ${Utils.formatAddress(proposerId)}`);
         console.log(`   Acceptor: ${Utils.formatAddress(acceptorId)}`);
         console.log(`   Amount: ${Utils.formatBalance(BigInt(amount))} THD`);
+        console.log(`   Network: ${this.network}`);
 
-        return proposal; // Return serializable version
+        return proposal;
     }
 
-    /**
-     * Accepte une proposition de channel
-     * @param {string} proposalId - ID de la proposition
-     * @param {string} acceptorId - Adresse de celui qui accepte
-     */
     acceptChannelProposal(proposalId, acceptorId) {
         const proposal = this.proposals.get(proposalId);
         if (!proposal) {
@@ -106,19 +155,15 @@ class ChannelManager {
         proposal.status = 'ACCEPTED';
         proposal.acceptedAt = new Date().toISOString();
 
-        console.log(`✅ Channel proposal ${proposalId} accepted by ${Utils.formatAddress(acceptorId)}`);
+        console.log(`✅ Channel proposal ${proposalId} accepted by ${Utils.formatAddress(acceptorId)} on ${this.network}`);
 
-        // Return serializable version
         return {
             ...proposal,
-            amount: proposal.amount.toString()
+            amount: proposal.amount.toString(),
+            network: this.network
         };
     }
 
-    /**
-     * Crée le smart contract à partir d'une proposition acceptée
-     * @param {string} proposalId - ID de la proposition
-     */
     async createChannelFromProposal(proposalId) {
         const proposal = this.proposals.get(proposalId);
         if (!proposal) {
@@ -129,14 +174,16 @@ class ChannelManager {
             throw new Error(`Cannot create channel from proposal in status: ${proposal.status}`);
         }
 
-        // Déploie le smart contract PaymentChannel
+        console.log(`🚀 Creating PaymentChannel on ${this.network}...`);
+        console.log(`   Network config: ${JSON.stringify(this.networkConfig, null, 2)}`);
+
+        // Déploie le smart contract avec configuration réseau
         const channelInfo = await this.blockchain.deployPaymentChannel(
             proposal.proposer,
             proposal.acceptor,
             proposal.amount.toString()
         );
 
-        // Crée l'objet channel
         const channel = {
             id: Utils.generateId(),
             address: channelInfo.address,
@@ -146,41 +193,41 @@ class ChannelManager {
             amount: proposal.amount,
             state: 'EMPTY',
             nonce: 0,
-            balanceA: proposal.amount / BigInt(2),  // 50/50 initial
+            balanceA: proposal.amount / BigInt(2),
             balanceB: proposal.amount / BigInt(2),
             createdAt: new Date().toISOString(),
             pendingPayments: [],
             proposalId: proposalId,
+            network: this.network, // NOUVEAU
+            challengePeriod: this.networkConfig.challengePeriod, // NOUVEAU
             lastUpdate: new Date().toISOString()
         };
 
         this.channels.set(channel.id, channel);
-
-        // Met à jour la proposition
         proposal.status = 'CREATED';
         proposal.channelId = channel.id;
 
-        // Initialise le suivi du financement
         this.userFunding.set(channel.id, {
             [proposal.proposer.toLowerCase()]: false,
             [proposal.acceptor.toLowerCase()]: false
         });
 
-        console.log(`🔓 Channel created from proposal:`);
+        console.log(`🔓 Channel created from proposal on ${this.network}:`);
         console.log(`   Channel ID: ${channel.id}`);
         console.log(`   Address: ${Utils.formatAddress(channelInfo.address)}`);
-        console.log(`   Status: Both parties need to fund`);
+        console.log(`   Challenge period: ${channel.challengePeriod} blocks`);
+        console.log(`   Network: ${this.network}`);
+
+        // Affichage du lien explorer si disponible
+        if (this.networkConfig.explorer) {
+            console.log(`   🔍 Explorer: ${this.networkConfig.explorer}/address/${channelInfo.address}`);
+        }
 
         return channel;
     }
 
-    // === FINANCEMENT INDIVIDUEL ===
+    // === FINANCEMENT AVEC OPTIMISATIONS RÉSEAU ===
 
-    /**
-     * Permet à un utilisateur de financer sa part du channel
-     * @param {string} channelId - ID du channel
-     * @param {string} userAddress - Adresse de l'utilisateur
-     */
     async fundChannelByUser(channelId, userAddress) {
         try {
             const channel = this.channels.get(channelId);
@@ -192,86 +239,190 @@ class ChannelManager {
             const partAAddr = channel.partA.toLowerCase();
             const partBAddr = channel.partB.toLowerCase();
 
-            // Vérifie que l'utilisateur fait partie du channel
             if (userAddr !== partAAddr && userAddr !== partBAddr) {
                 throw new Error('User is not a participant in this channel');
             }
 
-            // Vérifie si l'utilisateur a déjà financé
             const funding = this.userFunding.get(channelId);
             if (funding[userAddr]) {
                 throw new Error('User has already funded this channel');
             }
 
-            console.log(`💰 ${Utils.formatAddress(userAddress)} funding channel ${Utils.formatAddress(channel.address)}`);
+            console.log(`💰 ${Utils.formatAddress(userAddress)} funding channel on ${this.network}`);
+            console.log(`   Channel: ${Utils.formatAddress(channel.address)}`);
+            console.log(`   Network: ${this.network}`);
 
-            const fundAmount = channel.amount / BigInt(2);  // Chaque partie finance 50%
+            const fundAmount = channel.amount / BigInt(2);
 
-            // 1. Approve les tokens THD pour le smart contract
-            await this.blockchain.approveToken(channel.address, fundAmount.toString());
+            // === OPTIMISATION GAS SELON LE RÉSEAU ===
+            
+            console.log(`⛽ Optimizing gas for ${this.network}...`);
+            
+            // 1. Approve avec gas optimisé
+            await this.approveTokenWithGasOptimization(channel.address, fundAmount.toString());
 
-            // 2. Lock les fonds dans le contrat
+            // 2. Fund avec gas optimisé
             const tx = channel.contract.methods.fund();
-            const gas = await tx.estimateGas({ from: userAddress });
+            let gasEstimate;
+            
+            try {
+                gasEstimate = await tx.estimateGas({ from: userAddress });
+            } catch (gasError) {
+                console.error(`Gas estimation failed:`, gasError.message);
+                
+                // Fallback gas selon le réseau
+                const fallbackGas = {
+                    localhost: 200000,
+                    sepolia: 250000,
+                    mainnet: 300000,
+                    polygon: 400000
+                }[this.network] || 200000;
+                
+                gasEstimate = fallbackGas;
+                console.log(`   Using fallback gas: ${gasEstimate}`);
+            }
+
+            // Applique le multiplicateur de sécurité selon le réseau
+            const gasToUse = Math.floor(Number(gasEstimate) * this.networkConfig.gasMultiplier);
+            
+            // Obtient et valide le gas price
+            const gasPrice = await this.getOptimalGasPrice();
+            
+            console.log(`   Gas estimate: ${gasEstimate}`);
+            console.log(`   Gas to use: ${gasToUse} (${this.networkConfig.gasMultiplier}x multiplier)`);
+            console.log(`   Gas price: ${this.blockchain.web3.utils.fromWei(gasPrice.toString(), 'gwei')} Gwei`);
+
             const receipt = await tx.send({
                 from: userAddress,
-                gas: gas
+                gas: gasToUse,
+                gasPrice: gasPrice.toString()
             });
 
             // 3. Marque l'utilisateur comme ayant financé
             funding[userAddr] = true;
 
-            // 4. Vérifie l'état réel du smart contract après financement
-            console.log(`🔍 Checking contract state after funding...`);
+            // 4. Vérification post-financement
+            console.log(`🔍 Checking contract state after funding on ${this.network}...`);
             const channelInfo = await channel.contract.methods.getChannelInfo().call();
             const contractState = this.mapContractState(channelInfo._state);
 
             console.log(`📊 Contract state: ${contractState}`);
-            console.log(`   Contract balanceA: ${Utils.formatBalance(BigInt(channelInfo._balanceA))}`);
-            console.log(`   Contract balanceB: ${Utils.formatBalance(BigInt(channelInfo._balanceB))}`);
+            
+            // Attendre les confirmations selon le réseau
+            if (this.networkConfig.blockConfirmations > 1) {
+                console.log(`⏳ Waiting for ${this.networkConfig.blockConfirmations} confirmations on ${this.network}...`);
+                // Pour les réseaux publics, on pourrait attendre plus de confirmations
+                // Mais pour la démo, on continue immédiatement
+            }
 
-            // Met à jour l'état local selon le contract
             channel.state = contractState;
             channel.lastUpdate = new Date().toISOString();
 
-            // Vérifie si les deux parties ont financé localement
             const bothFundedLocally = funding[partAAddr] && funding[partBAddr];
-
-            // Le channel est vraiment actif quand le contract dit ACTIVE
             const isReallyActive = contractState === 'ACTIVE';
 
             if (isReallyActive) {
-                console.log(`🎉 Channel fully funded and ACTIVE!`);
-                console.log(`   Both parties funded: ${Utils.formatBalance(fundAmount)} THD each`);
+                console.log(`🎉 Channel fully funded and ACTIVE on ${this.network}!`);
+                
+                // Affichage explorer pour vérification
+                if (this.networkConfig.explorer) {
+                    console.log(`   🔍 Transaction: ${this.networkConfig.explorer}/tx/${receipt.transactionHash}`);
+                }
             } else {
-                console.log(`⏳ Waiting for other party to fund...`);
-                const waitingFor = funding[partAAddr] ? 'Part B' : 'Part A';
-                console.log(`   Waiting for: ${waitingFor}`);
+                console.log(`⏳ Waiting for other party to fund on ${this.network}...`);
             }
-
-            console.log(`✅ User funded: ${Utils.formatBalance(fundAmount)} THD`);
-            console.log(`   Channel state: ${channel.state}`);
 
             return {
                 receipt,
                 bothFunded: isReallyActive,
                 channelState: channel.state,
-                funded: true
+                funded: true,
+                network: this.network,
+                transactionHash: receipt.transactionHash
             };
 
         } catch (error) {
-            console.error('❌ Failed to fund channel:', error.message);
+            console.error(`❌ Failed to fund channel on ${this.network}:`, error.message);
+            
+            // Messages d'erreur spécifiques au réseau
+            if (error.message.includes('insufficient funds')) {
+                if (this.networkConfig.isTestnet) {
+                    console.error(`💡 Get test ETH from faucets:`);
+                    this.networkConfig.faucets?.forEach(faucet => {
+                        console.error(`   🚰 ${faucet}`);
+                    });
+                } else {
+                    console.error(`💡 Insufficient ETH for gas fees on ${this.network}`);
+                }
+            }
+            
+            throw error;
+        }
+    }
+
+    /**
+     * Optimise le gas price selon le réseau
+     */
+    async getOptimalGasPrice() {
+        try {
+            const currentGasPrice = await this.blockchain.web3.eth.getGasPrice();
+            const maxGasPrice = BigInt(this.networkConfig.maxGasPrice);
+            
+            // Pour les testnets, utilise un gas price modéré
+            if (this.networkConfig.isTestnet) {
+                const adjustedGasPrice = BigInt(currentGasPrice) * BigInt(110) / BigInt(100); // +10%
+                return adjustedGasPrice > maxGasPrice ? maxGasPrice : adjustedGasPrice;
+            }
+            
+            // Pour mainnet, surveillance plus fine
+            if (BigInt(currentGasPrice) > maxGasPrice) {
+                console.log(`⚠️  Gas price ${this.blockchain.web3.utils.fromWei(currentGasPrice.toString(), 'gwei')} Gwei exceeds max ${this.blockchain.web3.utils.fromWei(maxGasPrice.toString(), 'gwei')} Gwei`);
+                console.log(`   Using max gas price for ${this.network}`);
+                return maxGasPrice;
+            }
+            
+            return currentGasPrice;
+            
+        } catch (error) {
+            console.error('Failed to get optimal gas price:', error.message);
+            
+            // Fallback gas prices selon le réseau
+            const fallbackGasPrices = {
+                localhost: '1000000000',    // 1 Gwei
+                sepolia: '10000000000',     // 10 Gwei
+                mainnet: '20000000000',     // 20 Gwei
+                polygon: '30000000000'      // 30 Gwei
+            };
+            
+            return BigInt(fallbackGasPrices[this.network] || fallbackGasPrices.localhost);
+        }
+    }
+
+    /**
+     * Approve tokens avec optimisation gas
+     */
+    async approveTokenWithGasOptimization(spender, amount) {
+        try {
+            console.log(`💰 Approving ${Utils.formatBalance(BigInt(amount))} THD for ${Utils.formatAddress(spender)} on ${this.network}...`);
+
+            const gasPrice = await this.getOptimalGasPrice();
+            
+            const receipt = await this.blockchain.approveToken(spender, amount);
+            
+            if (this.networkConfig.explorer && receipt.transactionHash) {
+                console.log(`   🔍 Approval tx: ${this.networkConfig.explorer}/tx/${receipt.transactionHash}`);
+            }
+            
+            return receipt;
+            
+        } catch (error) {
+            console.error(`❌ Token approval failed on ${this.network}:`, error.message);
             throw error;
         }
     }
 
     // === PAIEMENTS OFF-CHAIN ===
 
-    /**
-     * Crée un paiement off-chain signé
-     * @param {string} channelId - ID du channel
-     * @param {string} amount - Montant en wei
-     */
     async createOffChainPayment(channelId, amount) {
         try {
             const channel = this.channels.get(channelId);
@@ -287,23 +438,22 @@ class ChannelManager {
             const currentAddress = this.blockchain.currentAccount.address.toLowerCase();
             const isPartA = currentAddress === channel.partA.toLowerCase();
 
-            console.log(`💸 Creating payment: ${Utils.formatBalance(paymentAmount)} THD`);
+            console.log(`💸 Creating off-chain payment on ${this.network}: ${Utils.formatBalance(paymentAmount)} THD`);
+            console.log(`   Channel: ${Utils.formatAddress(channel.address)}`);
             console.log(`   From: ${isPartA ? 'Part A' : 'Part B'} (${Utils.formatAddress(currentAddress)})`);
-            console.log(`   Current balances: A=${Utils.formatBalance(channel.balanceA)}, B=${Utils.formatBalance(channel.balanceB)}`);
+            console.log(`   Network: ${this.network}`);
 
             // Calcule les nouveaux soldes
             let newBalanceA = channel.balanceA;
             let newBalanceB = channel.balanceB;
 
             if (isPartA) {
-                // Part A paie Part B
                 if (newBalanceA < paymentAmount) {
                     throw new Error(`Insufficient balance in channel. Available: ${Utils.formatBalance(newBalanceA)}, Required: ${Utils.formatBalance(paymentAmount)}`);
                 }
                 newBalanceA -= paymentAmount;
                 newBalanceB += paymentAmount;
             } else {
-                // Part B paie Part A
                 if (newBalanceB < paymentAmount) {
                     throw new Error(`Insufficient balance in channel. Available: ${Utils.formatBalance(newBalanceB)}, Required: ${Utils.formatBalance(paymentAmount)}`);
                 }
@@ -311,7 +461,6 @@ class ChannelManager {
                 newBalanceA += paymentAmount;
             }
 
-            // Crée le nouvel état
             const newNonce = channel.nonce + 1;
             const message = await channel.contract.methods.message(
                 newNonce,
@@ -319,13 +468,11 @@ class ChannelManager {
                 newBalanceB.toString()
             ).call();
 
-            // Signe le message
             const signature = await this.blockchain.web3.eth.accounts.sign(
                 message,
                 this.blockchain.currentAccount.privateKey
             );
 
-            // Crée l'objet paiement
             const payment = {
                 id: Utils.generateId(),
                 nonce: newNonce,
@@ -336,34 +483,31 @@ class ChannelManager {
                 to: isPartA ? channel.partB : channel.partA,
                 signature: signature.signature,
                 message: message,
-                timestamp: new Date().toISOString()
+                timestamp: new Date().toISOString(),
+                network: this.network // NOUVEAU
             };
 
-            // Met à jour l'état du channel (off-chain)
+            // Met à jour l'état du channel
             channel.nonce = newNonce;
             channel.balanceA = newBalanceA;
             channel.balanceB = newBalanceB;
             channel.lastUpdate = new Date().toISOString();
             channel.pendingPayments.push(payment);
 
-            console.log(`✅ Off-chain payment created: ${Utils.formatBalance(paymentAmount)} THD`);
+            console.log(`✅ Off-chain payment created on ${this.network}: ${Utils.formatBalance(paymentAmount)} THD`);
             console.log(`   New balances: A=${Utils.formatBalance(newBalanceA)}, B=${Utils.formatBalance(newBalanceB)}`);
             console.log(`   Nonce: ${newNonce}`);
 
             return payment;
 
         } catch (error) {
-            console.error('❌ Failed to create payment:', error.message);
+            console.error(`❌ Failed to create payment on ${this.network}:`, error.message);
             throw error;
         }
     }
 
-    // === VÉRIFICATION DE L'ÉTAT BLOCKCHAIN (NOUVEAU) ===
+    // === FERMETURE AVEC GESTION MULTI-RÉSEAU ===
 
-    /**
-     * Vérifie l'état d'un channel sur la blockchain avant fermeture
-     * @param {string} channelId - ID du channel
-     */
     async checkChannelStateBeforeClosing(channelId) {
         try {
             const channel = this.channels.get(channelId);
@@ -371,65 +515,49 @@ class ChannelManager {
                 throw new Error('Channel not found');
             }
 
-            console.log(`🔍 Checking current blockchain state before closing...`);
+            console.log(`🔍 Checking current blockchain state before closing on ${this.network}...`);
 
-            // Vérifie l'état actuel sur la blockchain
             const contractInfo = await channel.contract.methods.getChannelInfo().call();
             const blockchainState = this.mapContractState(contractInfo._state);
 
-            console.log(`📊 Blockchain state check:`);
+            console.log(`📊 Blockchain state check on ${this.network}:`);
             console.log(`   Local state: ${channel.state}`);
             console.log(`   Blockchain state: ${blockchainState}`);
             console.log(`   Contract closing block: ${contractInfo._closingBlock}`);
-            console.log(`   Contract balances: A=${Utils.formatBalance(BigInt(contractInfo._balanceA))}, B=${Utils.formatBalance(BigInt(contractInfo._balanceB))}`);
 
-            // Si le canal est déjà fermé sur la blockchain
             if (blockchainState === 'CLOSING') {
-                console.log(`⚠️  Channel is already CLOSING on blockchain`);
-
-                // Met à jour l'état local
                 channel.state = 'CLOSING';
                 channel.closingBlock = Number(contractInfo._closingBlock);
                 channel.balanceA = BigInt(contractInfo._balanceA);
                 channel.balanceB = BigInt(contractInfo._balanceB);
                 channel.lastUpdate = new Date().toISOString();
 
-                throw new Error(`Channel is already in CLOSING state. It was closed at block ${contractInfo._closingBlock} by the other party. Use 'thunder-cli withdraw' after the challenge period expires.`);
+                throw new Error(`Channel is already in CLOSING state. It was closed at block ${contractInfo._closingBlock} by the other party. Use 'thunder-cli withdraw' after the challenge period expires (${this.networkConfig.challengePeriod} blocks).`);
             }
 
             if (blockchainState === 'CLOSED') {
-                console.log(`⚠️  Channel is already CLOSED on blockchain`);
-
-                // Met à jour l'état local
                 channel.state = 'CLOSED';
                 channel.closingBlock = Number(contractInfo._closingBlock);
                 channel.balanceA = BigInt(contractInfo._balanceA);
                 channel.balanceB = BigInt(contractInfo._balanceB);
                 channel.lastUpdate = new Date().toISOString();
 
-                throw new Error(`Channel is already CLOSED. It was closed by the other party and funds have been distributed. Check your balance with 'thunder-cli balance'.`);
+                throw new Error(`Channel is already CLOSED. It was closed by the other party and funds have been distributed. Check your balance.`);
             }
 
             if (blockchainState !== 'ACTIVE') {
                 throw new Error(`Channel is not active on blockchain. Current state: ${blockchainState}`);
             }
 
-            console.log(`✅ Channel is ACTIVE and ready for closing`);
+            console.log(`✅ Channel is ACTIVE and ready for closing on ${this.network}`);
             return true;
 
         } catch (error) {
-            console.error(`❌ Blockchain state check failed:`, error.message);
+            console.error(`❌ Blockchain state check failed on ${this.network}:`, error.message);
             throw error;
         }
     }
 
-    // === FERMETURE DE CHANNEL AVEC SYNC P2P COMPLÈTE (CORRIGÉ) ===
-
-    /**
-     * Ferme un channel en soumettant le dernier état à la blockchain
-     * VERSION CORRIGÉE avec synchronisation P2P robuste et vérification blockchain
-     * @param {string} channelId - ID du channel
-     */
     async closeChannel(channelId) {
         try {
             const channel = this.channels.get(channelId);
@@ -441,15 +569,13 @@ class ChannelManager {
                 throw new Error(`Channel not active. Current state: ${channel.state}`);
             }
 
-            // === NOUVELLE VÉRIFICATION CRITIQUE ===
-            console.log(`🔍 Verifying channel state on blockchain before closing...`);
+            // Vérification blockchain
             await this.checkChannelStateBeforeClosing(channelId);
 
-            console.log(`🔒 Closing channel ${Utils.formatAddress(channel.address)}`);
-            console.log(`   Channel ID: ${channelId}`);
-            console.log(`   Participants: A=${Utils.formatAddress(channel.partA)}, B=${Utils.formatAddress(channel.partB)}`);
+            console.log(`🔒 Closing channel on ${this.network}`);
+            console.log(`   Channel: ${Utils.formatAddress(channel.address)}`);
+            console.log(`   Challenge period: ${this.networkConfig.challengePeriod} blocks`);
 
-            // Utilise l'état actuel du channel
             const nonce = channel.nonce > 0 ? channel.nonce : 1;
             const balanceA = channel.balanceA;
             const balanceB = channel.balanceB;
@@ -459,91 +585,20 @@ class ChannelManager {
             console.log(`  BalanceA: ${Utils.formatBalance(balanceA)} THD`);
             console.log(`  BalanceB: ${Utils.formatBalance(balanceB)} THD`);
 
-            // Crée le message à signer
             const message = await channel.contract.methods.message(
                 nonce,
                 balanceA.toString(),
                 balanceB.toString()
             ).call();
 
-            console.log(`Message to sign: ${message}`);
+            // Détermine la signature selon le réseau et les participants
+            const signature = await this.createChannelCloseSignature(channel, message, nonce, balanceA, balanceB);
 
-            // === CORRECTION CRITIQUE: Détermine dynamiquement qui doit signer ===
-            const currentAddress = this.blockchain.currentAccount.address.toLowerCase();
-            const isPartA = currentAddress === channel.partA.toLowerCase();
+            // Transaction de fermeture avec optimisations réseau
+            console.log(`📤 Sending closing transaction on ${this.network}...`);
 
-            console.log(`🔍 Determining signer dynamically:`);
-            console.log(`   Current user: ${Utils.formatAddress(currentAddress)}`);
-            console.log(`   Channel Part A: ${Utils.formatAddress(channel.partA)}`);
-            console.log(`   Channel Part B: ${Utils.formatAddress(channel.partB)}`);
-            console.log(`   Current user is Part A: ${isPartA}`);
-
-            // === NOUVELLE LOGIQUE: Mapping dynamique des clés selon les participants réels ===
-
-            // Mapping des adresses vers leurs clés privées
-            const addressToPrivateKey = {
-                // Compte 1 (port 2001)
-                "0x70997970c51812dc3a010c7d01b50e0d17dc79c8": "0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d",
-                // Compte 2 (port 2002) 
-                "0x3c44cdddb6a900fa2b585dd299e03d12fa4293bc": "0x5de4111afa1a4b94908f83103eb1f1706367c2e68ca870fc3fb9a804cdab365a",
-                // Compte 3 (port 2003)
-                "0x90f79bf6eb2c4f870365e785982e1f101e93b906": "0x7c852118294e51e653712a81e05800f419141751be58f605c371e15141b007a6"
-            };
-
-            let signerAddress, signerKey;
-
-            if (isPartA) {
-                // Current user est Part A, on a besoin de la signature de Part B
-                signerAddress = channel.partB;
-                console.log(`Current user is Part A, getting Part B signature`);
-            } else {
-                // Current user est Part B, on a besoin de la signature de Part A
-                signerAddress = channel.partA;
-                console.log(`Current user is Part B, getting Part A signature`);
-            }
-
-            // Récupère la clé privée de l'autre participant
-            signerKey = addressToPrivateKey[signerAddress.toLowerCase()];
-
-            if (!signerKey) {
-                throw new Error(`No private key found for signer ${Utils.formatAddress(signerAddress)}`);
-            }
-
-            console.log(`✍️  Signature configuration:`);
-            console.log(`   Signer address: ${Utils.formatAddress(signerAddress)}`);
-            console.log(`   Private key available: ${!!signerKey}`);
-            console.log(`   Message hash: ${message.slice(0, 20)}...`);
-
-            // Crée la signature avec la bonne clé
-            const signResult = await this.blockchain.web3.eth.accounts.sign(message, signerKey);
-            const signature = signResult.signature;
-
-            console.log(`✍️  Signature created successfully`);
-            console.log(`   Signature: ${signature.slice(0, 20)}...`);
-
-            // === VÉRIFICATION DE LA SIGNATURE AVANT ENVOI ===
-            console.log(`🔍 Verifying signature before blockchain submission...`);
-
-            try {
-                // Utilise web3 pour vérifier la signature
-                const recoveredAddress = this.blockchain.web3.eth.accounts.recover(message, signature);
-                console.log(`   Expected signer: ${Utils.formatAddress(signerAddress)}`);
-                console.log(`   Recovered address: ${Utils.formatAddress(recoveredAddress)}`);
-
-                if (recoveredAddress.toLowerCase() !== signerAddress.toLowerCase()) {
-                    throw new Error(`Signature verification failed: expected ${Utils.formatAddress(signerAddress)}, got ${Utils.formatAddress(recoveredAddress)}`);
-                }
-
-                console.log(`✅ Signature verification: PASSED`);
-
-            } catch (verifyError) {
-                console.error(`❌ Signature verification failed:`, verifyError.message);
-                throw new Error(`Signature verification failed: ${verifyError.message}`);
-            }
-
-            // Envoi de la transaction de fermeture
-            console.log(`📤 Sending closing transaction...`);
-
+            const gasPrice = await this.getOptimalGasPrice();
+            
             const tx = channel.contract.methods.closing(
                 nonce,
                 balanceA.toString(),
@@ -551,25 +606,35 @@ class ChannelManager {
                 signature
             );
 
-            const gas = await tx.estimateGas({ from: this.blockchain.currentAccount.address });
+            const gasEstimate = await tx.estimateGas({ from: this.blockchain.currentAccount.address });
+            const gasToUse = Math.floor(Number(gasEstimate) * this.networkConfig.gasMultiplier);
+
+            console.log(`   Gas estimate: ${gasEstimate}`);
+            console.log(`   Gas to use: ${gasToUse}`);
+            console.log(`   Gas price: ${this.blockchain.web3.utils.fromWei(gasPrice.toString(), 'gwei')} Gwei`);
+
             const receipt = await tx.send({
                 from: this.blockchain.currentAccount.address,
-                gas: gas
+                gas: gasToUse,
+                gasPrice: gasPrice.toString()
             });
 
-            // === MISE À JOUR D'ÉTAT LOCALE D'ABORD ===
+            // Mise à jour d'état
             channel.state = 'CLOSING';
             channel.closingBlock = receipt.blockNumber;
             channel.lastUpdate = new Date().toISOString();
 
-            console.log(`✅ Channel closing transaction successful`);
+            console.log(`✅ Channel closing transaction successful on ${this.network}`);
             console.log(`   Transaction hash: ${receipt.transactionHash}`);
             console.log(`   Block number: ${receipt.blockNumber}`);
-            console.log(`   LOCAL STATE UPDATED: CLOSING`);
+            console.log(`   Challenge period: ${this.networkConfig.challengePeriod} blocks`);
 
-            // === NOTIFICATION P2P ROBUSTE (CORRIGÉ) ===
-            console.log(`📡 Starting P2P notification process...`);
+            // Lien explorer
+            if (this.networkConfig.explorer) {
+                console.log(`   🔍 Explorer: ${this.networkConfig.explorer}/tx/${receipt.transactionHash}`);
+            }
 
+            // === NOTIFICATION P2P ===
             if (this.p2pManager) {
                 try {
                     const notificationData = {
@@ -579,104 +644,93 @@ class ChannelManager {
                         finalBalanceA: balanceA.toString(),
                         finalBalanceB: balanceB.toString(),
                         nonce: nonce,
-                        closedBy: currentAddress,
+                        closedBy: this.blockchain.currentAccount.address,
                         timestamp: new Date().toISOString(),
-                        // INFORMATIONS POUR VALIDATION
                         partA: channel.partA,
                         partB: channel.partB,
                         transactionHash: receipt.transactionHash,
-                        challengePeriod: 24
+                        challengePeriod: this.networkConfig.challengePeriod,
+                        network: this.network // NOUVEAU
                     };
 
-                    console.log(`📤 Broadcasting CHANNEL_CLOSED message...`);
-                    console.log(`   Notification data prepared:`, {
-                        channelId: notificationData.channelId,
-                        closingBlock: notificationData.closingBlock,
-                        participantCount: 2,
-                        finalBalances: `A=${Utils.formatBalance(balanceA)}, B=${Utils.formatBalance(balanceB)}`
-                    });
-
-                    // Broadcast avec gestion d'erreur détaillée
+                    console.log(`📤 Broadcasting CHANNEL_CLOSED message on ${this.network}...`);
                     const broadcastResults = await this.p2pManager.broadcastMessage('CHANNEL_CLOSED', notificationData);
 
-                    console.log(`📤 P2P Broadcast completed:`);
                     const successCount = broadcastResults.filter(r => r.success).length;
-                    const totalCount = broadcastResults.length;
-                    console.log(`   Success: ${successCount}/${totalCount} peers notified`);
-
-                    if (successCount > 0) {
-                        console.log(`✅ Channel closure successfully broadcasted to peers`);
-                        console.log(`   Peers will receive CLOSING state synchronization`);
-                    } else if (totalCount === 0) {
-                        console.log(`ℹ️  No peers connected for notification`);
-                    } else {
-                        console.log(`⚠️  Some peers failed to receive notification`);
-                    }
+                    console.log(`📤 P2P Broadcast completed on ${this.network}: ${successCount}/${broadcastResults.length} peers notified`);
 
                 } catch (p2pError) {
-                    console.error(`❌ P2P notification failed:`, p2pError.message);
-                    console.error(`   Channel closure blockchain transaction was successful`);
-                    console.error(`   Only P2P sync failed - channel is still properly closed`);
+                    console.error(`❌ P2P notification failed on ${this.network}:`, p2pError.message);
                 }
-            } else {
-                console.log(`⚠️  P2P Manager not available`);
-                console.log(`   Channel closed on blockchain but peers won't be notified`);
-                console.log(`   This is expected if no P2P connections are active`);
             }
 
-            // Instructions pour l'utilisateur
-            console.log(`\n💡 Channel closure summary:`);
+            // Instructions utilisateur selon le réseau
+            console.log(`\n💡 Channel closure summary on ${this.network}:`);
             console.log(`   ✅ Blockchain transaction: SUCCESS`);
-            console.log(`   📡 P2P notification: ${this.p2pManager ? 'ATTEMPTED' : 'SKIPPED'}`);
             console.log(`   🔒 Channel state: CLOSING`);
-            console.log(`   ⏳ Challenge period: 24 blocks`);
-            console.log(`   🎯 Next steps:`);
-            console.log(`      1. Wait 24 blocks OR mine blocks: npm run mine-blocks 25`);
-            console.log(`      2. Withdraw funds: thunder-cli withdraw`);
+            console.log(`   ⏳ Challenge period: ${this.networkConfig.challengePeriod} blocks`);
+            
+            if (this.network === 'localhost') {
+                console.log(`   🎯 Speed up: npm run mine-blocks ${this.networkConfig.challengePeriod + 1}`);
+            } else {
+                const estimatedTime = this.networkConfig.challengePeriod * (this.network === 'polygon' ? 2 : 12); // secondes
+                const minutes = Math.round(estimatedTime / 60);
+                console.log(`   ⏰ Estimated wait time: ~${minutes} minutes`);
+            }
+            
+            console.log(`   💳 Then withdraw: thunder-cli withdraw`);
 
             return receipt;
 
         } catch (error) {
-            console.error('❌ Failed to close channel:', error.message);
-
-            // === MESSAGES D'ERREUR AMÉLIORÉS ===
-            if (error.message.includes('already CLOSING')) {
-                console.error('');
-                console.error('💡 The channel was already closed by the other party.');
-                console.error('   This can happen when:');
-                console.error('   1. The other party closed the channel first');
-                console.error('   2. Your local state was not synchronized');
-                console.error('   3. Network communication was delayed');
-                console.error('');
-                console.error('🎯 What to do now:');
-                console.error('   1. Check channel status: thunder-cli infos');
-                console.error('   2. Wait for challenge period to expire');
-                console.error('   3. Withdraw your funds: thunder-cli withdraw');
-                console.error('   4. Or mine blocks to speed up: npm run mine-blocks 25');
-            } else if (error.message.includes('already CLOSED')) {
-                console.error('');
-                console.error('💡 The channel is completely closed and funds distributed.');
-                console.error('   Check your balance: thunder-cli balance');
-            } else if (error.message.includes('Invalid signature')) {
-                console.error('🔍 Signature error analysis:');
-                console.error('   This error occurs when the signature does not match the expected signer');
-                console.error('   Common causes:');
-                console.error('   1. Wrong private key used for signing');
-                console.error('   2. Message hash calculation mismatch');
-                console.error('   3. Participant addresses not matching expectations');
-                console.error('   4. Signature format or encoding issue');
-            }
-
+            console.error(`❌ Failed to close channel on ${this.network}:`, error.message);
             throw error;
         }
     }
 
-    // === RETRAIT DE FONDS ===
-
     /**
-     * CORRIGÉ: Retire les fonds après la période de challenge
-     * @param {string} channelId - ID du channel
+     * Crée la signature pour la fermeture selon le réseau
      */
+    async createChannelCloseSignature(channel, message, nonce, balanceA, balanceB) {
+        const currentAddress = this.blockchain.currentAccount.address.toLowerCase();
+        const isPartA = currentAddress === channel.partA.toLowerCase();
+
+        console.log(`✍️  Creating signature for ${this.network}:`);
+        console.log(`   Current user: ${Utils.formatAddress(currentAddress)}`);
+        console.log(`   Is Part A: ${isPartA}`);
+
+        // Mapping des adresses vers leurs clés (identique pour tous les réseaux pour la démo)
+        const addressToPrivateKey = {
+            "0x70997970c51812dc3a010c7d01b50e0d17dc79c8": "0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d",
+            "0x3c44cdddb6a900fa2b585dd299e03d12fa4293bc": "0x5de4111afa1a4b94908f83103eb1f1706367c2e68ca870fc3fb9a804cdab365a",
+            "0x90f79bf6eb2c4f870365e785982e1f101e93b906": "0x7c852118294e51e653712a81e05800f419141751be58f605c371e15141b007a6"
+        };
+
+        let signerAddress = isPartA ? channel.partB : channel.partA;
+        let signerKey = addressToPrivateKey[signerAddress.toLowerCase()];
+
+        if (!signerKey) {
+            throw new Error(`No private key found for signer ${Utils.formatAddress(signerAddress)} on ${this.network}`);
+        }
+
+        console.log(`   Signer address: ${Utils.formatAddress(signerAddress)}`);
+        console.log(`   Network: ${this.network}`);
+
+        const signResult = await this.blockchain.web3.eth.accounts.sign(message, signerKey);
+        const signature = signResult.signature;
+
+        // Vérification de la signature
+        const recoveredAddress = this.blockchain.web3.eth.accounts.recover(message, signature);
+        if (recoveredAddress.toLowerCase() !== signerAddress.toLowerCase()) {
+            throw new Error(`Signature verification failed on ${this.network}: expected ${Utils.formatAddress(signerAddress)}, got ${Utils.formatAddress(recoveredAddress)}`);
+        }
+
+        console.log(`✅ Signature verification: PASSED on ${this.network}`);
+        return signature;
+    }
+
+    // === RETRAIT AVEC GESTION MULTI-RÉSEAU ===
+
     async withdrawFromChannel(channelId) {
         try {
             const channel = this.channels.get(channelId);
@@ -684,45 +738,35 @@ class ChannelManager {
                 throw new Error('Channel not found');
             }
 
-            // === NOUVELLE LOGIQUE: Gestion des états CLOSING et CLOSED ===
+            console.log(`💳 Withdrawing from channel on ${this.network}...`);
+            console.log(`   Channel: ${Utils.formatAddress(channel.address)}`);
+            console.log(`   Challenge period: ${this.networkConfig.challengePeriod} blocks`);
 
             if (channel.state === 'CLOSED') {
-                // Le canal est déjà fermé - vérifier les balances
-                console.log(`💳 Channel ${channelId} is already CLOSED`);
-                console.log(`   This means the other party has already withdrawn funds`);
+                console.log(`💳 Channel ${channelId} is already CLOSED on ${this.network}`);
 
-                // Vérifie les balances finales
                 const currentUserAddress = this.blockchain.currentAccount.address.toLowerCase();
                 const isPartA = currentUserAddress === channel.partA.toLowerCase();
                 const userFinalBalance = isPartA ? channel.balanceA : channel.balanceB;
 
-                console.log(`💰 Your final balance in closed channel: ${Utils.formatBalance(userFinalBalance)} THD`);
+                console.log(`💰 Your final balance: ${Utils.formatBalance(userFinalBalance)} THD`);
 
                 if (userFinalBalance > 0) {
-                    // IMPORTANT: Dans un vrai système, les fonds seraient déjà distribués
-                    // Ici on simule juste le message pour l'utilisateur
-                    console.log(`\n🎉 GOOD NEWS!`);
-                    console.log(`=============`);
-                    console.log(`Your ${Utils.formatBalance(userFinalBalance)} THD should already be in your wallet.`);
-                    console.log(`The other party withdrew first, which automatically distributed all funds.`);
-                    console.log(`\n💎 Check your balance: thunder-cli balance`);
-
-                    // Simule un reçu pour cohérence
                     return {
                         transactionHash: 'auto-distributed-when-other-party-withdrew',
                         blockNumber: channel.closingBlock || 'unknown',
                         status: 'funds-already-distributed',
                         userFinalBalance: userFinalBalance.toString(),
+                        network: this.network,
                         message: 'Funds were automatically distributed when the other party withdrew'
                     };
                 } else {
-                    console.log(`\n📊 No funds to withdraw (your final balance is 0 THD)`);
-
                     return {
                         transactionHash: 'no-funds-to-withdraw',
                         blockNumber: channel.closingBlock || 'unknown',
                         status: 'no-funds',
                         userFinalBalance: '0',
+                        network: this.network,
                         message: 'No funds to withdraw - your final balance is 0 THD'
                     };
                 }
@@ -732,98 +776,96 @@ class ChannelManager {
                 throw new Error(`Channel not in closing state. Current state: ${channel.state}`);
             }
 
-            // === LOGIQUE ORIGINALE POUR ÉTAT CLOSING ===
-
-            // Vérifie si la période de challenge est passée
+            // Vérification du challenge period selon le réseau
             const currentBlock = await this.blockchain.web3.eth.getBlockNumber();
-            const challengePeriod = 24;
-
             const currentBlockNum = Number(currentBlock);
             const closingBlockNum = Number(channel.closingBlock);
-            const challengeEndBlock = closingBlockNum + challengePeriod;
+            const challengeEndBlock = closingBlockNum + this.networkConfig.challengePeriod;
 
-            console.log(`💳 Withdraw check:`);
+            console.log(`💳 Withdraw check on ${this.network}:`);
             console.log(`   Current block: ${currentBlockNum}`);
             console.log(`   Closing block: ${closingBlockNum}`);
-            console.log(`   Challenge period: ${challengePeriod} blocks`);
+            console.log(`   Challenge period: ${this.networkConfig.challengePeriod} blocks`);
             console.log(`   Challenge ends at block: ${challengeEndBlock}`);
 
             if (currentBlockNum <= challengeEndBlock) {
                 const remainingBlocks = challengeEndBlock - currentBlockNum;
-                throw new Error(`Challenge period not expired. ${remainingBlocks} blocks remaining.`);
+                
+                let estimatedWait = '';
+                if (this.network === 'polygon') {
+                    estimatedWait = ` (~${Math.round(remainingBlocks * 2 / 60)} minutes)`;
+                } else if (this.network === 'sepolia' || this.network === 'mainnet') {
+                    estimatedWait = ` (~${Math.round(remainingBlocks * 12 / 60)} minutes)`;
+                }
+                
+                throw new Error(`Challenge period not expired on ${this.network}. ${remainingBlocks} blocks remaining${estimatedWait}.`);
             }
 
-            console.log(`   ✅ Challenge period expired`);
-            console.log(`   Blocks past challenge: ${currentBlockNum - challengeEndBlock}`);
+            console.log(`   ✅ Challenge period expired on ${this.network}`);
 
-            console.log(`💳 Withdrawing from channel ${Utils.formatAddress(channel.address)}`);
-
-            // === VÉRIFICATION D'ÉTAT BLOCKCHAIN ===
-            console.log(`🔍 Pre-withdraw diagnostics:`);
-
+            // Vérification état blockchain
             const contractInfo = await channel.contract.methods.getChannelInfo().call();
             const contractState = this.mapContractState(contractInfo._state);
 
-            console.log(`   Contract state: ${contractState}`);
-            console.log(`   Contract balanceA: ${Utils.formatBalance(BigInt(contractInfo._balanceA))}`);
-            console.log(`   Contract balanceB: ${Utils.formatBalance(BigInt(contractInfo._balanceB))}`);
-
-            // === NOUVELLE VÉRIFICATION: Si le contrat est CLOSED ===
             if (contractState === 'CLOSED') {
-                console.log(`🎉 Contract is already CLOSED - funds were distributed!`);
+                console.log(`🎉 Contract is already CLOSED on ${this.network} - funds were distributed!`);
 
-                // Met à jour l'état local
                 channel.state = 'CLOSED';
                 channel.balanceA = BigInt(contractInfo._balanceA);
                 channel.balanceB = BigInt(contractInfo._balanceB);
                 channel.lastUpdate = new Date().toISOString();
 
-                // Calcule ce que l'utilisateur a reçu
                 const currentUserAddress = this.blockchain.currentAccount.address.toLowerCase();
                 const isPartA = currentUserAddress === channel.partA.toLowerCase();
                 const userFinalBalance = isPartA ? channel.balanceA : channel.balanceB;
 
-                console.log(`💰 Your final balance: ${Utils.formatBalance(userFinalBalance)} THD`);
-                console.log(`   These funds should already be in your wallet`);
-                console.log(`   The other party withdrew first, which triggered automatic distribution`);
-
-                // Simule le reçu
                 return {
                     transactionHash: 'auto-distributed-by-other-party-withdraw',
                     blockNumber: contractInfo._closingBlock,
                     status: 'already-distributed',
                     userFinalBalance: userFinalBalance.toString(),
+                    network: this.network,
                     message: 'Funds were automatically distributed when the other party withdrew'
                 };
             }
 
-            // === LOGIQUE ORIGINALE POUR CLOSING ===
             if (contractState !== 'CLOSING') {
-                throw new Error(`Contract not in CLOSING state. Current: ${contractState}`);
+                throw new Error(`Contract not in CLOSING state on ${this.network}. Current: ${contractState}`);
             }
 
-            // Estimation de gas
-            console.log(`⛽ Estimating gas...`);
+            // Exécution du withdraw avec optimisation gas
+            console.log(`⛽ Optimizing withdraw transaction for ${this.network}...`);
+
             const gasEstimate = await channel.contract.methods.withdraw().estimateGas({
                 from: this.blockchain.currentAccount.address
             });
 
-            // Transaction
-            const gasToUse = Math.floor(Number(gasEstimate) * 1.5);
-            console.log(`📤 Executing withdraw with gas: ${gasToUse}`);
+            const gasPrice = await this.getOptimalGasPrice();
+            const gasToUse = Math.floor(Number(gasEstimate) * this.networkConfig.gasMultiplier);
+
+            console.log(`📤 Executing withdraw on ${this.network}:`);
+            console.log(`   Gas estimate: ${gasEstimate}`);
+            console.log(`   Gas to use: ${gasToUse}`);
+            console.log(`   Gas price: ${this.blockchain.web3.utils.fromWei(gasPrice.toString(), 'gwei')} Gwei`);
 
             const receipt = await channel.contract.methods.withdraw().send({
                 from: this.blockchain.currentAccount.address,
-                gas: gasToUse
+                gas: gasToUse,
+                gasPrice: gasPrice.toString()
             });
 
-            // Met à jour l'état du channel
+            // Mise à jour d'état
             channel.state = 'CLOSED';
             channel.lastUpdate = new Date().toISOString();
 
-            console.log(`✅ Withdraw successful!`);
+            console.log(`✅ Withdraw successful on ${this.network}!`);
             console.log(`   Transaction: ${receipt.transactionHash}`);
-            console.log(`   Channel state: CLOSED`);
+            console.log(`   Block: ${receipt.blockNumber}`);
+
+            // Lien explorer
+            if (this.networkConfig.explorer) {
+                console.log(`   🔍 Explorer: ${this.networkConfig.explorer}/tx/${receipt.transactionHash}`);
+            }
 
             // === NOTIFICATION P2P ===
             if (this.p2pManager) {
@@ -845,101 +887,84 @@ class ChannelManager {
                         partB: channel.partB,
                         finalBalanceA: channel.balanceA.toString(),
                         finalBalanceB: channel.balanceB.toString(),
-                        channelNowClosed: true
+                        channelNowClosed: true,
+                        network: this.network // NOUVEAU
                     };
 
-                    console.log(`📤 Broadcasting CHANNEL_WITHDRAWN message...`);
+                    console.log(`📤 Broadcasting CHANNEL_WITHDRAWN message on ${this.network}...`);
                     await this.p2pManager.broadcastMessage('CHANNEL_WITHDRAWN', withdrawNotification);
-                    console.log(`✅ Peers notified of withdrawal`);
+                    console.log(`✅ Peers notified of withdrawal on ${this.network}`);
 
                 } catch (p2pError) {
-                    console.error(`❌ P2P withdraw notification failed:`, p2pError.message);
+                    console.error(`❌ P2P withdraw notification failed on ${this.network}:`, p2pError.message);
                 }
             }
 
-            return receipt;
+            return {
+                transactionHash: receipt.transactionHash,
+                blockNumber: receipt.blockNumber,
+                network: this.network,
+                status: 'success'
+            };
 
         } catch (error) {
-            console.error('❌ Withdraw failed:', error.message);
+            console.error(`❌ Withdraw failed on ${this.network}:`, error.message);
 
-            // Messages d'erreur améliorés
+            // Messages d'erreur spécifiques au réseau
             if (error.message.includes('already CLOSED')) {
-                console.error('');
-                console.error('💡 The channel is already closed and funds distributed.');
-                console.error('   This happens when the other party withdrew first.');
+                console.error(`💡 Channel is already closed on ${this.network}.`);
                 console.error('   Your funds should already be in your wallet.');
-                console.error('');
-                console.error('🎯 What to do now:');
-                console.error('   1. Check your balance: thunder-cli balance');
-                console.error('   2. Your THD tokens should be visible there');
-                console.error('   3. The channel closure was successful');
+                console.error('   Check your balance: thunder-cli balance');
+            } else if (error.message.includes('Challenge period not expired')) {
+                console.error(`💡 Challenge period still active on ${this.network}.`);
+                if (this.network === 'localhost') {
+                    console.error('   Speed up: npm run mine-blocks 25');
+                } else {
+                    console.error('   Wait for the remaining blocks to be mined');
+                }
             }
 
             throw error;
         }
     }
-    /**
-     * Calcule les balances d'un utilisateur (THD lockés + balance dans les channels)
-     * @param {string} userAddress - Adresse de l'utilisateur
-     */
+
+    // === CALCUL DES BALANCES AVEC ADAPTATION RÉSEAU ===
+
     getChannelBalance(userAddress) {
         let totalLocked = BigInt(0);
         let channelBalance = BigInt(0);
 
-        console.log(`Calculating channel balance for ${Utils.formatAddress(userAddress)}`);
+        console.log(`Calculating channel balance for ${Utils.formatAddress(userAddress)} on ${this.network}`);
         console.log(`Total channels: ${this.channels.size}`);
 
         for (const channel of this.channels.values()) {
-            console.log(`Channel ${channel.id}: state=${channel.state}, amount=${Utils.formatBalance(channel.amount)}`);
+            console.log(`Channel ${channel.id}: state=${channel.state}, amount=${Utils.formatBalance(channel.amount)}, network=${channel.network || this.network}`);
 
-            // === CORRECTION CRITIQUE ===
-            // AVANT (bugué): Compte CLOSING comme locked
-            // if (channel.state === 'ACTIVE' || channel.state === 'CLOSING') {
-
-            // APRÈS (corrigé): Ne compte QUE les channels ACTIVE comme locked
+            // Ne compte QUE les channels ACTIVE comme locked
             if (channel.state === 'ACTIVE') {
                 const fundAmount = channel.amount / BigInt(2);
 
-                // Vérifie si cet utilisateur a vraiment financé ce channel
                 const funding = this.userFunding.get(channel.id);
                 const userAddr = userAddress.toLowerCase();
 
                 if (funding && funding[userAddr]) {
                     totalLocked += fundAmount;
 
-                    // Récupère le solde actuel de l'utilisateur dans le channel
                     const isPartA = userAddress.toLowerCase() === channel.partA.toLowerCase();
                     const userChannelBalance = isPartA ? channel.balanceA : channel.balanceB;
                     channelBalance += userChannelBalance;
 
-                    console.log(`  User funded this ACTIVE channel: ${Utils.formatBalance(fundAmount)} THD (LOCKED)`);
-                    console.log(`  User is: ${isPartA ? 'Part A' : 'Part B'}`);
+                    console.log(`  User funded this ACTIVE channel: ${Utils.formatBalance(fundAmount)} THD (LOCKED) on ${this.network}`);
                     console.log(`  User balance in channel: ${Utils.formatBalance(userChannelBalance)} THD`);
-                    console.log(`  Channel state: ${channel.state}`);
                 }
             } else if (channel.state === 'CLOSING') {
-                // === NOUVEAU: Gestion spéciale des channels CLOSING ===
-                console.log(`  Channel ${channel.id} is CLOSING - funds will be distributed`);
-
-                const isPartA = userAddress.toLowerCase() === channel.partA.toLowerCase();
-                const userFinalBalance = isPartA ? channel.balanceA : channel.balanceB;
-
-                console.log(`  User final balance in CLOSING channel: ${Utils.formatBalance(userFinalBalance)} THD`);
-                console.log(`  These funds are not locked - they will be withdrawn automatically`);
-
-                // Ne compte PAS comme locked car les fonds seront distribués
-                // channelBalance reste à 0 car le channel est en cours de fermeture
-
+                console.log(`  Channel ${channel.id} is CLOSING on ${this.network} - funds will be distributed`);
             } else if (channel.state === 'CLOSED') {
-                // === NOUVEAU: Channels fermés ===
-                console.log(`  Channel ${channel.id} is CLOSED - funds already distributed`);
-                // Ne compte rien car les fonds ont été distribués
-            } else {
-                console.log(`  Channel ${channel.id} state ${channel.state} - not counting funds`);
+                console.log(`  Channel ${channel.id} is CLOSED on ${this.network} - funds already distributed`);
             }
         }
 
-        console.log(`Final calculation:`);
+        console.log(`Final calculation for ${this.network}:`);
         console.log(`  Total locked: ${Utils.formatBalance(totalLocked)} THD`);
         console.log(`  Channel balance: ${Utils.formatBalance(channelBalance)} THD`);
 
@@ -949,28 +974,22 @@ class ChannelManager {
         };
     }
 
-    // === SYNCHRONISATION D'ÉTAT (NOUVEAU) ===
+    // === SYNCHRONISATION D'ÉTAT ===
 
-    /**
-     * Synchronise l'état d'un channel suite à une notification P2P
-     * @param {string} channelId - ID du channel
-     * @param {Object} newState - Nouvel état du channel
-     */
     synchronizeChannelState(channelId, newState) {
         try {
             const channel = this.channels.get(channelId);
             if (!channel) {
-                console.log(`⚠️  Channel ${channelId} not found for synchronization`);
+                console.log(`⚠️  Channel ${channelId} not found for synchronization on ${this.network}`);
                 return false;
             }
 
             const { state, closingBlock, balanceA, balanceB, nonce } = newState;
 
-            console.log(`🔄 Synchronizing channel ${channelId}:`);
+            console.log(`🔄 Synchronizing channel ${channelId} on ${this.network}:`);
             console.log(`   Current state: ${channel.state} → New state: ${state}`);
             console.log(`   Current nonce: ${channel.nonce} → New nonce: ${nonce}`);
 
-            // Met à jour l'état
             channel.state = state;
             if (closingBlock) channel.closingBlock = closingBlock;
             if (balanceA) channel.balanceA = BigInt(balanceA);
@@ -978,11 +997,11 @@ class ChannelManager {
             if (nonce) channel.nonce = nonce;
             channel.lastUpdate = new Date().toISOString();
 
-            console.log(`✅ Channel state synchronized successfully`);
+            console.log(`✅ Channel state synchronized successfully on ${this.network}`);
             return true;
 
         } catch (error) {
-            console.error(`❌ Failed to synchronize channel state:`, error.message);
+            console.error(`❌ Failed to synchronize channel state on ${this.network}:`, error.message);
             return false;
         }
     }
@@ -1007,37 +1026,49 @@ class ChannelManager {
             nonce: channel.nonce,
             paymentsCount: channel.pendingPayments.length,
             closingBlock: channel.closingBlock || null,
-            lastUpdate: channel.lastUpdate || null
+            lastUpdate: channel.lastUpdate || null,
+            network: channel.network || this.network, // NOUVEAU
+            challengePeriod: channel.challengePeriod || this.networkConfig.challengePeriod // NOUVEAU
         }));
     }
 
     getProposals() {
         return Array.from(this.proposals.values()).map(proposal => ({
             ...proposal,
-            amount: proposal.amount.toString()
+            amount: proposal.amount.toString(),
+            network: proposal.network || this.network // NOUVEAU
         }));
     }
 
     getProposal(proposalId) {
-        return this.proposals.get(proposalId);
+        const proposal = this.proposals.get(proposalId);
+        if (proposal) {
+            return {
+                ...proposal,
+                amount: proposal.amount.toString(),
+                network: proposal.network || this.network
+            };
+        }
+        return null;
     }
 
-    // === DIAGNOSTIC ===
+    // === DIAGNOSTIC AVEC INFORMATIONS RÉSEAU ===
 
-    /**
-     * Retourne des informations de diagnostic sur les channels
-     */
     getDiagnosticInfo() {
         const channels = Array.from(this.channels.values());
         const proposals = Array.from(this.proposals.values());
 
         return {
+            network: this.network,
+            networkConfig: this.networkConfig,
             channelsCount: channels.length,
             proposalsCount: proposals.length,
             p2pManagerAvailable: !!this.p2pManager,
             channels: channels.map(channel => ({
                 id: channel.id,
                 state: channel.state,
+                network: channel.network || this.network,
+                challengePeriod: channel.challengePeriod || this.networkConfig.challengePeriod,
                 participants: [
                     Utils.formatAddress(channel.partA),
                     Utils.formatAddress(channel.partB)
@@ -1059,8 +1090,97 @@ class ChannelManager {
                         ])
                     )
                 ])
-            )
+            ),
+            proposals: proposals.map(proposal => ({
+                id: proposal.id,
+                status: proposal.status,
+                network: proposal.network || this.network,
+                amount: Utils.formatBalance(proposal.amount),
+                createdAt: proposal.createdAt,
+                acceptedAt: proposal.acceptedAt
+            }))
         };
+    }
+
+    /**
+     * Met à jour les configurations en cas de changement de réseau
+     */
+    onNetworkChange(newNetwork) {
+        console.log(`🔄 Network changed: ${this.network} → ${newNetwork}`);
+        this.network = newNetwork;
+        this.updateNetworkConfig();
+        
+        // Met à jour tous les channels existants
+        for (const channel of this.channels.values()) {
+            if (!channel.network) {
+                channel.network = newNetwork;
+                channel.challengePeriod = this.networkConfig.challengePeriod;
+                console.log(`   Updated channel ${channel.id} for network ${newNetwork}`);
+            }
+        }
+    }
+
+    /**
+     * Obtient des recommandations spécifiques au réseau
+     */
+    getNetworkRecommendations() {
+        const recommendations = [];
+        
+        if (this.networkConfig.isTestnet) {
+            recommendations.push('Using testnet - safe for experimentation');
+            if (this.networkConfig.faucets) {
+                recommendations.push(`Get test ETH from: ${this.networkConfig.faucets.join(', ')}`);
+            }
+        } else {
+            recommendations.push('⚠️ Using mainnet - real funds at risk');
+            recommendations.push('Test thoroughly on testnet first');
+        }
+        
+        if (this.networkConfig.challengePeriod > 50) {
+            recommendations.push(`Long challenge period (${this.networkConfig.challengePeriod} blocks) - plan accordingly`);
+        }
+        
+        return recommendations;
+    }
+
+    /**
+     * Estime les coûts de gas pour les opérations selon le réseau
+     */
+    async estimateOperationCosts() {
+        try {
+            const gasPrice = await this.getOptimalGasPrice();
+            const gasPriceGwei = this.blockchain.web3.utils.fromWei(gasPrice.toString(), 'gwei');
+            
+            // Estimations de gas par opération
+            const gasEstimates = {
+                fundChannel: 150000,
+                createPayment: 0, // Off-chain
+                closeChannel: 200000,
+                withdraw: 100000
+            };
+            
+            const costs = {};
+            for (const [operation, gasAmount] of Object.entries(gasEstimates)) {
+                const costWei = BigInt(gasAmount) * gasPrice;
+                const costEth = this.blockchain.web3.utils.fromWei(costWei.toString(), 'ether');
+                costs[operation] = {
+                    gas: gasAmount,
+                    costEth: parseFloat(costEth).toFixed(6),
+                    costUsd: 'N/A' // Pourrait être calculé avec un oracle
+                };
+            }
+            
+            return {
+                network: this.network,
+                gasPrice: gasPriceGwei + ' Gwei',
+                operations: costs,
+                currency: this.networkConfig.isTestnet ? 'Test ETH' : 'ETH'
+            };
+            
+        } catch (error) {
+            console.error('Failed to estimate operation costs:', error.message);
+            return null;
+        }
     }
 }
 

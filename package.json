@@ -1,23 +1,27 @@
 {
-  "name": "thunder-payment-channel",
-  "version": "1.0.0",
-  "description": "Payment channels implementation on Ethereum using THD tokens",
-  "main": "src/thunderd.js",
   "scripts": {
     "node": "npx hardhat node",
     "deploy": "npx hardhat run scripts/deploy.js --network localhost",
+    "deploy:sepolia": "npx hardhat run scripts/deploy-sepolia.js --network sepolia",
+    "verify:sepolia": "npx hardhat verify --network sepolia",
     "compile": "npx hardhat compile",
     "test": "npx hardhat test",
     "clean": "npx hardhat clean",
     "thunderd": "node src/thunderd.js",
+    "thunderd:sepolia": "node src/thunderd.js --rpc $SEPOLIA_RPC_URL",
     "thunderd:dev": "node src/thunderd.js --port 2001",
     "thunder-cli": "node src/thunder-cli.js",
     "mine-blocks": "npx hardhat run scripts/mine-blocks.js --network localhost",
     "build": "npm run compile",
     "start": "npm run thunderd",
+    "start:sepolia": "npm run thunderd:sepolia",
     "dev": "npm run thunderd:dev",
     "build:exe": "./build.sh",
-    "pkg:install": "npm install -g pkg"
+    "pkg:install": "npm install -g pkg",
+    "setup:sepolia": "echo 'Setting up Sepolia environment...' && npm run deploy:sepolia",
+    "test:sepolia": "npm run deploy:sepolia && npm run thunderd:sepolia",
+    "status:sepolia": "curl -s https://sepolia.etherscan.io/api?module=stats&action=ethsupply",
+    "faucet:help": "echo 'Get Sepolia ETH: https://sepoliafaucet.com/ or https://faucets.chain.link/sepolia'"
   },
   "pkg": {
     "scripts": [
@@ -46,7 +50,9 @@
     "web3",
     "smart-contracts",
     "defi",
-    "layer2"
+    "layer2",
+    "sepolia",
+    "testnet"
   ],
   "author": "Thunder Team",
   "license": "MIT",

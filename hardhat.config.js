@@ -12,6 +12,7 @@ module.exports = {
     }
   },
   networks: {
+    // Réseau local (gardé pour développement)
     localhost: {
       url: "http://127.0.0.1:8545",
       chainId: 31337,
@@ -25,6 +26,14 @@ module.exports = {
     },
     hardhat: {
       chainId: 31337
+    },
+    // NOUVEAU: Configuration Sepolia
+    sepolia: {
+      url: process.env.SEPOLIA_RPC_URL || "https://sepolia.infura.io/v3/58909409a7284713a2f83d6d6fe7dd3c",
+      chainId: 11155111,
+      accounts: process.env.PRIVATE_KEY ? [process.env.PRIVATE_KEY] : [],
+      gasPrice: "auto",
+      gas: "auto"
     }
   },
   paths: {
@@ -32,5 +41,9 @@ module.exports = {
     tests: "./test",
     cache: "./cache",
     artifacts: "./artifacts"
+  },
+  // Configuration pour la vérification sur Etherscan
+  etherscan: {
+    apiKey: process.env.ETHERSCAN_API_KEY
   }
 };

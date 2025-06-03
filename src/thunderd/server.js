@@ -2,15 +2,17 @@
  * FICHIER: src/thunderd/server.js
  * 
  * DESCRIPTION:
- * Serveur principal Thunder qui expose une API REST pour les payment channels.
- * VERSION COMPLÈTE avec injection P2P, synchronisation des fermetures ET support bidirectionnel.
+ * Serveur principal Thunder avec support complet multi-réseau (localhost, Sepolia, mainnet).
+ * VERSION COMPLÈTE avec injection P2P, synchronisation des fermetures, support bidirectionnel
+ * et configuration automatique selon le réseau détecté.
  * 
- * NOUVELLES FONCTIONNALITÉS:
- * - Support bidirectionnel complet pour les propositions de channels
- * - Résolution robuste des peers avec mapping proposalId ↔ peerAddress
- * - Détermination dynamique de l'acceptor selon le port du peer
- * - Injection P2P critique pour synchronisation des fermetures
- * - Endpoints de diagnostic avancés
+ * NOUVELLES FONCTIONNALITÉS SEPOLIA:
+ * - Auto-détection du réseau selon l'RPC
+ * - Configuration dynamique des wallets selon le réseau
+ * - Support des endpoints Sepolia publics
+ * - Gestion des faucets et explorers
+ * - Diagnostic réseau avancé
+ * - Messages d'aide contextuels
  */
 
 const express = require('express');
@@ -22,25 +24,70 @@ const P2PManager = require('./p2p');
 const Utils = require('../shared/utils');
 
 class ThunderdServer {
-    constructor(port = 2001) {
+    constructor(port = 2001, rpcUrl = null) {
         this.port = port;
+        this.rpcUrl = rpcUrl || this.getDefaultRpcUrl();
         this.app = express();
         this.server = http.createServer(this.app);
         this.io = socketIo(this.server);
+        
+        // Détection automatique du réseau
+        this.detectedNetwork = this.detectNetworkFromRpc(this.rpcUrl);
 
         // Managers
-        this.blockchain = new BlockchainManager();
+        this.blockchain = new BlockchainManager(this.rpcUrl, this.detectedNetwork);
         this.channelManager = null;
         this.p2pManager = null;
         this.connectedPeers = new Map();
         this.channels = new Map();
         this.wallet = null;
 
+        // Statistiques du serveur
+        this.startTime = Date.now();
+        this.requestCount = 0;
+        this.networkInfo = null;
+
         this.setupMiddleware();
         this.setupRoutes();
         this.setupSocketHandlers();
 
-        console.log(`🏗️  ThunderdServer initialized on port ${this.port} with bidirectional support`);
+        console.log(`🏗️  ThunderdServer initialized`);
+        console.log(`   Port: ${this.port}`);
+        console.log(`   RPC: ${this.rpcUrl}`);
+        console.log(`   Detected Network: ${this.detectedNetwork.toUpperCase()}`);
+    }
+
+    // === DÉTECTION AUTOMATIQUE DU RÉSEAU ===
+
+    /**
+     * Obtient l'URL RPC par défaut selon les variables d'environnement
+     */
+    getDefaultRpcUrl() {
+        if (process.env.SEPOLIA_RPC_URL) {
+            return process.env.SEPOLIA_RPC_URL;
+        }
+        if (process.env.MAINNET_RPC_URL) {
+            return process.env.MAINNET_RPC_URL;
+        }
+        return 'http://127.0.0.1:8545'; // localhost par défaut
+    }
+
+    /**
+     * Détecte le réseau à partir de l'URL RPC
+     */
+    detectNetworkFromRpc(rpcUrl) {
+        if (!rpcUrl) return 'localhost';
+        
+        const url = rpcUrl.toLowerCase();
+        
+        if (url.includes('sepolia')) return 'sepolia';
+        if (url.includes('mainnet') || url.includes('cloudflare') || url.includes('infura.io/v3') && !url.includes('sepolia')) return 'mainnet';
+        if (url.includes('polygon')) return 'polygon';
+        if (url.includes('arbitrum')) return 'arbitrum';
+        if (url.includes('optimism')) return 'optimism';
+        if (url.includes('127.0.0.1') || url.includes('localhost')) return 'localhost';
+        
+        return 'unknown';
     }
 
     // === MIDDLEWARE SETUP ===
@@ -58,10 +105,11 @@ class ThunderdServer {
             next();
         });
 
-        // Request logging
+        // Request logging et compteur
         this.app.use((req, res, next) => {
+            this.requestCount++;
             const timestamp = new Date().toISOString();
-            console.log(`[${timestamp}] ${req.method} ${req.path}`);
+            console.log(`[${timestamp}] ${req.method} ${req.path} (${this.detectedNetwork})`);
             next();
         });
     }
@@ -69,45 +117,134 @@ class ThunderdServer {
     // === API ROUTES ===
 
     setupRoutes() {
-        // Health check endpoint
-        this.app.get('/health', (req, res) => {
-            res.json({
-                status: 'OK',
-                timestamp: new Date().toISOString(),
-                port: this.port,
-                version: '1.0.0-bidirectional',
-                capabilities: ['channels', 'payments', 'p2p', 'channel-sync', 'bidirectional-proposals']
-            });
+        // Health check endpoint avec informations réseau
+        this.app.get('/health', async (req, res) => {
+            try {
+                const uptime = Math.floor((Date.now() - this.startTime) / 1000);
+                const blockchainHealth = await this.blockchain.healthCheck();
+                
+                res.json({
+                    status: 'OK',
+                    timestamp: new Date().toISOString(),
+                    port: this.port,
+                    version: '1.0.0-sepolia',
+                    network: this.detectedNetwork,
+                    rpc: this.rpcUrl,
+                    uptime: uptime,
+                    requests: this.requestCount,
+                    blockchain: blockchainHealth,
+                    capabilities: [
+                        'channels', 
+                        'payments', 
+                        'p2p', 
+                        'channel-sync', 
+                        'bidirectional-proposals',
+                        'multi-network',
+                        'sepolia-support'
+                    ]
+                });
+            } catch (error) {
+                res.status(500).json({
+                    status: 'ERROR',
+                    error: error.message,
+                    timestamp: new Date().toISOString()
+                });
+            }
         });
 
-        // === ENDPOINTS DE DIAGNOSTIC (CRITIQUES POUR DEBUG) ===
+        // === ENDPOINTS DE DIAGNOSTIC AVANCÉS ===
 
         this.app.get('/debug/system', (req, res) => {
             try {
+                const networkInfo = this.blockchain.getNetworkInfo();
+                
                 res.json({
                     success: true,
                     timestamp: new Date().toISOString(),
-                    port: this.port,
+                    server: {
+                        port: this.port,
+                        rpcUrl: this.rpcUrl,
+                        detectedNetwork: this.detectedNetwork,
+                        uptime: Math.floor((Date.now() - this.startTime) / 1000),
+                        requestCount: this.requestCount,
+                        version: '1.0.0-sepolia'
+                    },
                     components: {
                         blockchain: !!this.blockchain,
                         channelManager: !!this.channelManager,
                         p2pManager: !!this.p2pManager,
                         wallet: !!this.wallet
                     },
+                    network: networkInfo,
                     injections: {
                         p2pIntoChannelManager: this.channelManager ? !!this.channelManager.p2pManager : false
                     },
                     features: {
+                        multiNetwork: true,
+                        sepoliaSupport: true,
                         bidirectionalProposals: true,
                         proposalMapping: !!this.p2pManager?.proposalToPeerMap,
                         channelSync: !!(this.channelManager && this.channelManager.p2pManager)
                     },
-                    uptime: process.uptime(),
+                    environment: {
+                        nodeEnv: process.env.NODE_ENV || 'development',
+                        hasSepoliaRpc: !!process.env.SEPOLIA_RPC_URL,
+                        hasMainnetRpc: !!process.env.MAINNET_RPC_URL,
+                        hasPrivateKey: !!process.env.PRIVATE_KEY
+                    },
                     memoryUsage: process.memoryUsage(),
-                    version: '1.0.0-bidirectional'
+                    cpuUsage: process.cpuUsage()
                 });
             } catch (error) {
                 console.error('Debug system error:', error);
+                res.status(500).json({
+                    success: false,
+                    error: error.message,
+                    timestamp: new Date().toISOString()
+                });
+            }
+        });
+
+        this.app.get('/debug/network', async (req, res) => {
+            try {
+                const networkInfo = this.blockchain.getNetworkInfo();
+                const networkDetails = Utils.getNetworkInfo(networkInfo.chainId);
+                
+                // Test de connectivité
+                let connectivityTest = null;
+                try {
+                    const blockNumber = await this.blockchain.web3.eth.getBlockNumber();
+                    const gasPrice = await this.blockchain.web3.eth.getGasPrice();
+                    
+                    connectivityTest = {
+                        success: true,
+                        blockNumber: Number(blockNumber),
+                        gasPrice: this.blockchain.web3.utils.fromWei(gasPrice.toString(), 'gwei') + ' Gwei',
+                        responseTime: 'Fast'
+                    };
+                } catch (error) {
+                    connectivityTest = {
+                        success: false,
+                        error: error.message
+                    };
+                }
+
+                res.json({
+                    success: true,
+                    timestamp: new Date().toISOString(),
+                    rpcUrl: this.rpcUrl,
+                    detectedNetwork: this.detectedNetwork,
+                    networkInfo: networkInfo,
+                    networkDetails: networkDetails,
+                    connectivity: connectivityTest,
+                    deploymentStatus: {
+                        hasDeployment: !!this.blockchain.deploymentInfo,
+                        thdToken: this.blockchain.deploymentInfo?.thdToken || null,
+                        deployedAt: this.blockchain.deploymentInfo?.deployedAt || null
+                    },
+                    recommendations: this.getNetworkRecommendations()
+                });
+            } catch (error) {
                 res.status(500).json({
                     success: false,
                     error: error.message,
@@ -125,7 +262,8 @@ class ThunderdServer {
                         ...channel,
                         funding: this.channelManager.userFunding.get(channel.id),
                         pendingPayments: fullChannel?.pendingPayments?.length || 0,
-                        lastUpdate: fullChannel?.lastUpdate || 'unknown'
+                        lastUpdate: fullChannel?.lastUpdate || 'unknown',
+                        networkType: this.detectedNetwork
                     };
                 });
 
@@ -134,12 +272,14 @@ class ThunderdServer {
                 res.json({
                     success: true,
                     timestamp: new Date().toISOString(),
+                    network: this.detectedNetwork,
                     channels: detailedChannels,
                     diagnostic: diagnosticInfo,
                     p2pConnected: !!this.p2pManager,
                     peersCount: this.p2pManager ? this.p2pManager.getPeers().length : 0,
                     walletLoaded: !!this.wallet,
-                    bidirectionalSupport: true
+                    contractsDeployed: !!this.blockchain.deploymentInfo,
+                    multiNetworkSupport: true
                 });
             } catch (error) {
                 console.error('Debug channels error:', error);
@@ -158,9 +298,15 @@ class ThunderdServer {
                 res.json({
                     success: true,
                     timestamp: new Date().toISOString(),
+                    network: this.detectedNetwork,
                     p2pManager: !!this.p2pManager,
                     diagnostic: p2pInfo,
-                    bidirectionalMappings: p2pInfo.proposalMappings || {}
+                    bidirectionalMappings: p2pInfo.proposalMappings || {},
+                    globalConnectivity: {
+                        networkType: this.detectedNetwork,
+                        publicNetwork: ['sepolia', 'mainnet', 'polygon'].includes(this.detectedNetwork),
+                        canConnectGlobally: this.detectedNetwork !== 'localhost'
+                    }
                 });
             } catch (error) {
                 console.error('Debug P2P error:', error);
@@ -172,11 +318,11 @@ class ThunderdServer {
             }
         });
 
-        // === INFORMATIONS DU NODE ===
+        // === INFORMATIONS DU NODE AVEC SUPPORT MULTI-RÉSEAU ===
 
         this.app.get('/infos', (req, res) => {
             try {
-                console.log(`📊 Processing /infos request...`);
+                console.log(`📊 Processing /infos request for ${this.detectedNetwork}...`);
 
                 const channels = this.channelManager ? this.channelManager.getChannels() : [];
                 const peers = this.p2pManager ? this.p2pManager.getPeers() : [];
@@ -184,8 +330,7 @@ class ThunderdServer {
 
                 console.log(`   Raw data: ${channels.length} channels, ${peers.length} peers, ${proposals.length} proposals`);
 
-                // === FONCTION UTILITAIRE DE SÉRIALISATION ROBUSTE ===
-
+                // Fonction de sérialisation robuste
                 function serializeBigIntDeep(obj, path = '') {
                     if (obj === null || obj === undefined) {
                         return obj;
@@ -214,72 +359,60 @@ class ThunderdServer {
                     return obj;
                 }
 
-                // === SÉRIALISATION DES PROPOSALS ===
-
-                console.log(`   Serializing proposals...`);
+                // Sérialisation des données
                 const serializedProposals = proposals.map((proposal, index) => {
                     console.log(`     Proposal ${index}: ${proposal.id} (amount: ${typeof proposal.amount})`);
                     return serializeBigIntDeep(proposal, `proposal[${index}]`);
                 });
 
-                // === SÉRIALISATION DES CHANNELS (ROBUSTE) ===
-
-                console.log(`   Serializing channels...`);
                 const serializedChannels = channels.map((channel, index) => {
                     console.log(`     Channel ${index}: ${channel.id} (state: ${channel.state})`);
-                    console.log(`       amount type: ${typeof channel.amount}`);
-                    console.log(`       balanceA type: ${typeof channel.balanceA}`);
-                    console.log(`       balanceB type: ${typeof channel.balanceB}`);
-
                     return serializeBigIntDeep(channel, `channel[${index}]`);
                 });
 
-                // === SÉRIALISATION DES PEERS ===
-
-                console.log(`   Serializing peers...`);
                 const serializedPeers = serializeBigIntDeep(peers, 'peers');
-
-                // === SÉRIALISATION DE BLOCKCHAIN INFO ===
-
-                console.log(`   Serializing blockchain info...`);
                 const blockchainInfo = serializeBigIntDeep(
                     this.blockchain.getNetworkInfo(),
                     'blockchain'
                 );
 
-                // === CONSTRUCTION DE LA RÉPONSE ===
-
+                // Construction de la réponse avec informations réseau
                 const responseData = {
                     port: this.port,
+                    network: this.detectedNetwork,
+                    rpcUrl: this.rpcUrl,
                     connectedPeers: serializedPeers,
                     channels: serializedChannels,
                     pendingProposals: serializedProposals,
                     blockchain: blockchainInfo,
                     wallet: this.wallet ? Utils.formatAddress(this.wallet.address) : null,
-                    version: '1.0.0-bidirectional',
-                    uptime: process.uptime(),
+                    version: '1.0.0-sepolia',
+                    uptime: Math.floor((Date.now() - this.startTime) / 1000),
+                    requestCount: this.requestCount,
                     features: {
                         p2pSyncEnabled: !!(this.channelManager && this.channelManager.p2pManager),
                         bidirectionalProposals: true,
-                        proposalMappingActive: !!this.p2pManager?.proposalToPeerMap
-                    }
+                        proposalMappingActive: !!this.p2pManager?.proposalToPeerMap,
+                        multiNetworkSupport: true,
+                        sepoliaSupport: true,
+                        globalConnectivity: this.detectedNetwork !== 'localhost'
+                    },
+                    networkDetails: this.getNetworkDetails(),
+                    helpLinks: this.getHelpLinks()
                 };
 
-                // === VÉRIFICATION FINALE ===
-
-                console.log(`   Final serialization check...`);
+                // Vérification finale de sérialisation
                 const finalSerialized = serializeBigIntDeep(responseData, 'response');
 
-                // Test de sérialisation JSON
                 try {
                     JSON.stringify(finalSerialized);
-                    console.log(`✅ JSON serialization test passed`);
+                    console.log(`✅ JSON serialization test passed for ${this.detectedNetwork}`);
                 } catch (jsonError) {
                     console.error(`❌ JSON serialization test failed:`, jsonError.message);
                     throw new Error(`JSON serialization failed: ${jsonError.message}`);
                 }
 
-                console.log(`📊 /infos response ready - sending to client`);
+                console.log(`📊 /infos response ready for ${this.detectedNetwork} - sending to client`);
                 res.json(finalSerialized);
 
             } catch (error) {
@@ -289,13 +422,14 @@ class ThunderdServer {
                 res.status(500).json({
                     success: false,
                     error: 'Internal server error',
+                    network: this.detectedNetwork,
                     timestamp: new Date().toISOString(),
                     details: process.env.NODE_ENV === 'development' ? error.message : 'Server error'
                 });
             }
         });
 
-        // === GESTION DU WALLET ===
+        // === GESTION DU WALLET AVEC SUPPORT MULTI-RÉSEAU ===
 
         this.app.post('/importwallet', async (req, res) => {
             try {
@@ -305,18 +439,58 @@ class ThunderdServer {
                     await this.blockchain.setAccount(privateKey);
                     this.wallet = this.blockchain.currentAccount;
                 } else if (seedPhrase) {
-                    // === CORRECTION: Détermine la clé selon le port du node ===
                     let testPrivateKey;
 
-                    if (this.port === 2001) {
-                        testPrivateKey = "0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d";
-                    } else if (this.port === 2002) {
-                        testPrivateKey = "0x5de4111afa1a4b94908f83103eb1f1706367c2e68ca870fc3fb9a804cdab365a";
-                    } else if (this.port === 2003) {
-                        testPrivateKey = "0x7c852118294e51e653712a81e05800f419141751be58f605c371e15141b007a6";
+                    if (this.detectedNetwork === 'sepolia') {
+                        // Pour Sepolia, utilise les seed phrases pour mapper aux bonnes clés
+                        const sepoliaWallets = {
+                            "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about": "0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d",
+                            "test test test test test test test test test test test junk": "0x5de4111afa1a4b94908f83103eb1f1706367c2e68ca870fc3fb9a804cdab365a",
+                            "legal winner thank year wave sausage worth useful legal winner thank yellow": "0x7c852118294e51e653712a81e05800f419141751be58f605c371e15141b007a6",
+                            "letter advice cage absurd amount doctor acoustic avoid letter advice cage above": "0x47e179ec197488593b187f80a00eb0da91f1b9d0b13f8733639f19c30a34926a"
+                        };
+                        
+                        testPrivateKey = sepoliaWallets[seedPhrase];
+                        
+                        if (!testPrivateKey) {
+                            // Charge les wallets depuis le fichier de déploiement
+                            try {
+                                const deploymentInfo = Utils.loadDeploymentInfo('sepolia');
+                                if (deploymentInfo.testWallets) {
+                                    const matchingWallet = deploymentInfo.testWallets.find(w => 
+                                        w.mnemonic && w.mnemonic.phrase === seedPhrase
+                                    );
+                                    if (matchingWallet) {
+                                        testPrivateKey = matchingWallet.privateKey;
+                                    }
+                                }
+                            } catch (error) {
+                                console.log('Could not load Sepolia test wallets:', error.message);
+                            }
+                        }
+                        
+                        if (!testPrivateKey) {
+                            throw new Error(`Seed phrase not recognized for Sepolia. Available test phrases:
+                            - "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about"
+                            - "test test test test test test test test test test test junk"
+                            Or check deployments/sepolia-test-wallets.json for more wallets.`);
+                        }
+                        
+                    } else if (this.detectedNetwork === 'localhost') {
+                        // Pour localhost, utilise l'ancienne logique basée sur le port
+                        if (this.port === 2001) {
+                            testPrivateKey = "0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d";
+                        } else if (this.port === 2002) {
+                            testPrivateKey = "0x5de4111afa1a4b94908f83103eb1f1706367c2e68ca870fc3fb9a804cdab365a";
+                        } else if (this.port === 2003) {
+                            testPrivateKey = "0x7c852118294e51e653712a81e05800f419141751be58f605c371e15141b007a6";
+                        } else {
+                            testPrivateKey = "0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d";
+                        }
                     } else {
-                        // Fallback
+                        // Pour autres réseaux, utilise le premier wallet par défaut
                         testPrivateKey = "0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d";
+                        console.log(`⚠️  Using default wallet for ${this.detectedNetwork}. Consider providing specific private key.`);
                     }
 
                     await this.blockchain.setAccount(testPrivateKey);
@@ -325,24 +499,37 @@ class ThunderdServer {
                     throw new Error('No privateKey or seedPhrase provided');
                 }
 
-                console.log(`🔐 Wallet imported on port ${this.port}: ${Utils.formatAddress(this.wallet.address)}`);
+                const networkInfo = this.blockchain.getNetworkInfo();
+                
+                console.log(`🔐 Wallet imported on ${this.detectedNetwork}:`);
+                console.log(`   Address: ${Utils.formatAddress(this.wallet.address)}`);
+                console.log(`   Port: ${this.port}`);
+                console.log(`   Network: ${networkInfo.network}`);
+
+                // Informations d'aide selon le réseau
+                const helpInfo = this.getWalletHelpInfo();
 
                 res.json({
                     success: true,
                     address: this.wallet.address,
+                    network: this.detectedNetwork,
+                    chainId: networkInfo.chainId,
                     port: this.port,
-                    message: 'Wallet imported successfully'
+                    message: `Wallet imported successfully on ${this.detectedNetwork}`,
+                    helpInfo: helpInfo
                 });
             } catch (error) {
                 console.error('Import wallet error:', error.message);
                 res.status(400).json({
                     success: false,
-                    error: error.message
+                    error: error.message,
+                    network: this.detectedNetwork,
+                    suggestions: this.getWalletErrorSuggestions(error.message)
                 });
             }
         });
 
-        // === BALANCES ===
+        // === BALANCES AVEC INFORMATIONS RÉSEAU ===
 
         this.app.get('/balance', async (req, res) => {
             try {
@@ -350,39 +537,52 @@ class ThunderdServer {
                     throw new Error('No wallet imported');
                 }
 
-                // 1. Récupère le balance BRUT du wallet
                 const walletBalance = await this.blockchain.getBalance();
-
-                // 2. Récupère les infos des channels
                 const channelBalance = this.getChannelBalance();
+                const networkInfo = this.blockchain.getNetworkInfo();
 
-                console.log(`Balance request for ${Utils.formatAddress(this.wallet.address)}:`);
+                console.log(`Balance request for ${Utils.formatAddress(this.wallet.address)} on ${this.detectedNetwork}:`);
                 console.log(`  Raw wallet balance: ${walletBalance.formatted} THD`);
                 console.log(`  Channel locked: ${Utils.formatBalance(channelBalance.locked)} THD`);
                 console.log(`  Channel balance: ${Utils.formatBalance(channelBalance.balance)} THD`);
 
-                // === LOGIQUE ESCROW CORRIGÉE ===
                 const availableBalance = walletBalance.balance;
                 const lockedBalance = channelBalance.locked;
                 const totalBalance = availableBalance + lockedBalance;
 
-                console.log(`  Available (wallet): ${Utils.formatBalance(availableBalance)} THD`);
-                console.log(`  Locked (escrow): ${Utils.formatBalance(lockedBalance)} THD`);
-                console.log(`  Total calculated: ${Utils.formatBalance(totalBalance)} THD`);
+                // Obtenir le solde ETH pour les frais
+                let ethBalance = '0';
+                try {
+                    const ethBalanceWei = await this.blockchain.web3.eth.getBalance(this.wallet.address);
+                    ethBalance = this.blockchain.web3.utils.fromWei(ethBalanceWei, 'ether');
+                } catch (error) {
+                    console.log('Could not fetch ETH balance:', error.message);
+                }
 
                 res.json({
                     success: true,
                     address: walletBalance.address,
+                    network: this.detectedNetwork,
+                    chainId: networkInfo.chainId,
                     totalTHD: Utils.formatBalance(totalBalance),
                     availableTHD: Utils.formatBalance(availableBalance),
                     channelTHD: Utils.formatBalance(lockedBalance),
-                    channelBalance: Utils.formatBalance(channelBalance.balance)
+                    channelBalance: Utils.formatBalance(channelBalance.balance),
+                    ethBalance: parseFloat(ethBalance).toFixed(6) + ' ETH',
+                    networkInfo: {
+                        name: this.detectedNetwork,
+                        explorer: networkInfo.explorer,
+                        nativeCurrency: Utils.getNetworkInfo(networkInfo.chainId).nativeCurrency
+                    },
+                    recommendations: this.getBalanceRecommendations(ethBalance)
                 });
             } catch (error) {
                 console.error('Balance error:', error.message);
                 res.status(400).json({
                     success: false,
-                    error: error.message
+                    error: error.message,
+                    network: this.detectedNetwork,
+                    suggestions: this.getBalanceErrorSuggestions(error.message)
                 });
             }
         });
@@ -403,20 +603,23 @@ class ThunderdServer {
                     success: true,
                     message: `Connected to ${host}:${port}`,
                     peer: `${host}:${port}`,
+                    network: this.detectedNetwork,
+                    globalConnectivity: this.detectedNetwork !== 'localhost',
                     bidirectionalSupport: true
                 });
             } catch (error) {
                 console.error('Connect error:', error);
                 res.status(400).json({
                     success: false,
-                    error: error.message
+                    error: error.message,
+                    network: this.detectedNetwork,
+                    suggestions: this.getConnectionErrorSuggestions(error.message)
                 });
             }
         });
 
-        // === NOUVEAU WORKFLOW P2P BIDIRECTIONNEL ===
+        // === WORKFLOW P2P BIDIRECTIONNEL (identique mais avec informations réseau) ===
 
-        // Proposer un channel CORRIGÉ BIDIRECTIONNEL
         this.app.post('/proposechannel', async (req, res) => {
             try {
                 if (!this.wallet) {
@@ -435,34 +638,42 @@ class ThunderdServer {
 
                 const amountWei = this.blockchain.web3.utils.toWei(amount, 'ether');
 
-                // === CORRECTION CRITIQUE: Détermine dynamiquement l'acceptor selon le port du peer ===
-
-                console.log(`🔍 Determining acceptor for proposal...`);
+                console.log(`🔍 Determining acceptor for proposal on ${this.detectedNetwork}...`);
                 console.log(`   Proposer (current user): ${Utils.formatAddress(this.wallet.address)}`);
                 console.log(`   Target peer: ${peerAddress}`);
 
-                // Détermine l'acceptor selon le port du peer
+                // Détermine l'acceptor selon le réseau et le port du peer
                 let acceptorAddress;
 
-                if (peerAddress.includes(':2001')) {
-                    // Si on propose à port 2001, utilise l'adresse du compte 1  
-                    acceptorAddress = "0x70997970C51812dc3A010C7d01b50e0d17dc79C8";
-                } else if (peerAddress.includes(':2002')) {
-                    // Si on propose à port 2002, utilise l'adresse du compte 2
-                    acceptorAddress = "0x3C44CdDdB6a900fa2b585dd299e03d12FA4293BC";
-                } else if (peerAddress.includes(':2003')) {
-                    // Si on propose à port 2003, utilise l'adresse du compte 3
-                    acceptorAddress = "0x90F79bf6EB2c4f870365E785982E1f101E93b906";
+                if (this.detectedNetwork === 'localhost') {
+                    // Localhost: logique par port
+                    if (peerAddress.includes(':2001')) {
+                        acceptorAddress = "0x70997970C51812dc3A010C7d01b50e0d17dc79C8";
+                    } else if (peerAddress.includes(':2002')) {
+                        acceptorAddress = "0x3C44CdDdB6a900fa2b585dd299e03d12FA4293BC";
+                    } else if (peerAddress.includes(':2003')) {
+                        acceptorAddress = "0x90F79bf6EB2c4f870365E785982E1f101E93b906";
+                    } else {
+                        acceptorAddress = "0x3C44CdDdB6a900fa2b585dd299e03d12FA4293BC";
+                    }
                 } else {
-                    // Fallback: utilise l'adresse du compte 2
-                    acceptorAddress = "0x3C44CdDdB6a900fa2b585dd299e03d12FA4293BC";
+                    // Réseaux publics: utilise les adresses des wallets de test
+                    const testWallets = Utils.getTestWallets(this.detectedNetwork);
+                    if (testWallets.length > 1) {
+                        // Utilise un wallet différent du proposer
+                        const acceptorWallet = testWallets.find(w => 
+                            w.address.toLowerCase() !== this.wallet.address.toLowerCase()
+                        );
+                        acceptorAddress = acceptorWallet ? acceptorWallet.address : "0x3C44CdDdB6a900fa2b585dd299e03d12FA4293BC";
+                    } else {
+                        acceptorAddress = "0x3C44CdDdB6a900fa2b585dd299e03d12FA4293BC";
+                    }
                 }
 
                 console.log(`   Determined acceptor: ${Utils.formatAddress(acceptorAddress)}`);
 
-                // === CORRECTION: Évite la proposition à soi-même ===
                 if (this.wallet.address.toLowerCase() === acceptorAddress.toLowerCase()) {
-                    throw new Error('Cannot propose a channel to yourself. Connect to a different peer with a different port.');
+                    throw new Error('Cannot propose a channel to yourself. Connect to a different peer with a different wallet.');
                 }
 
                 const proposal = this.channelManager.createChannelProposal(
@@ -471,16 +682,11 @@ class ThunderdServer {
                     amountWei
                 );
 
-                // === CORRECTION CRITIQUE: Enregistre le mapping avant envoi ===
                 this.p2pManager.registerProposalPeer(proposal.id, peerAddress, 'outgoing');
 
-                console.log(`📤 Sending proposal ${proposal.id} to ${peerAddress}...`);
-                console.log(`   Mapping registered: ${proposal.id} → ${peerAddress} (outgoing)`);
+                console.log(`📤 Sending proposal ${proposal.id} to ${peerAddress} on ${this.detectedNetwork}...`);
 
-                // Envoie la proposition via P2P
                 await this.p2pManager.sendMessage(peerAddress, 'CHANNEL_PROPOSAL', proposal);
-
-                console.log(`✅ Proposal sent successfully`);
 
                 res.json({
                     success: true,
@@ -492,6 +698,7 @@ class ThunderdServer {
                         status: proposal.status,
                         proposer: Utils.formatAddress(proposal.proposer),
                         acceptor: Utils.formatAddress(proposal.acceptor),
+                        network: this.detectedNetwork,
                         bidirectional: true
                     }
                 });
@@ -499,7 +706,8 @@ class ThunderdServer {
                 console.error('Propose channel error:', error);
                 res.status(400).json({
                     success: false,
-                    error: error.message
+                    error: error.message,
+                    network: this.detectedNetwork
                 });
             }
         });
@@ -515,10 +723,8 @@ class ThunderdServer {
 
                 const proposal = this.channelManager.acceptChannelProposal(proposalId, this.wallet.address);
 
-                // Notifie le proposer via P2P que la proposition est acceptée
                 if (this.p2pManager) {
                     try {
-                        // === CORRECTION: Utilise d'abord le mapping bidirectionnel ===
                         const proposalMapping = this.p2pManager.getPeerForProposal(proposalId);
                         let targetPeer = null;
 
@@ -526,7 +732,6 @@ class ThunderdServer {
                             targetPeer = proposalMapping.peer;
                             console.log(`📋 Found peer via bidirectional mapping: ${targetPeer}`);
                         } else {
-                            // Fallback vers l'ancienne méthode
                             const originalProposal = this.p2pManager.getProposal(proposalId);
                             if (originalProposal && originalProposal.peer) {
                                 targetPeer = originalProposal.peer;
@@ -538,39 +743,41 @@ class ThunderdServer {
                             await this.p2pManager.sendMessage(targetPeer, 'CHANNEL_ACCEPTED', {
                                 proposalId,
                                 acceptor: this.wallet.address,
+                                network: this.detectedNetwork,
                                 timestamp: new Date().toISOString()
                             });
-                            console.log(`📤 Notified proposer about acceptance`);
+                            console.log(`📤 Notified proposer about acceptance on ${this.detectedNetwork}`);
                         } else {
                             console.error('❌ No peer found to notify about acceptance');
                         }
                     } catch (p2pError) {
                         console.error('Failed to notify proposer:', p2pError.message);
-                        // Continue même si la notification P2P échoue
                     }
                 }
 
-                // Sérialise les BigInt pour JSON
                 const serializedProposal = {
                     ...proposal,
-                    amount: proposal.amount.toString()
+                    amount: proposal.amount.toString(),
+                    network: this.detectedNetwork
                 };
 
                 res.json({
                     success: true,
                     message: `Channel proposal ${proposalId} accepted`,
-                    proposal: serializedProposal
+                    proposal: serializedProposal,
+                    network: this.detectedNetwork
                 });
             } catch (error) {
                 console.error('Accept channel error:', error);
                 res.status(400).json({
                     success: false,
-                    error: error.message
+                    error: error.message,
+                    network: this.detectedNetwork
                 });
             }
         });
 
-        // Créer le channel à partir d'une proposition CORRIGÉ BIDIRECTIONNEL
+        // Créer le channel à partir d'une proposition
         this.app.post('/createchannel', async (req, res) => {
             try {
                 if (!this.wallet) {
@@ -579,16 +786,14 @@ class ThunderdServer {
 
                 const { proposalId } = req.body;
 
-                console.log(`🔓 Creating channel from proposal ${proposalId}...`);
+                console.log(`🔓 Creating channel from proposal ${proposalId} on ${this.detectedNetwork}...`);
 
                 const channel = await this.channelManager.createChannelFromProposal(proposalId);
 
-                // === CORRECTION CRITIQUE: Résolution robuste du peer avec mapping bidirectionnel ===
                 if (this.p2pManager) {
                     try {
                         console.log(`🔍 Looking up peer for proposal ${proposalId}...`);
 
-                        // Étape 1: Essaie le mapping bidirectionnel (NOUVEAU ET CRITIQUE)
                         const proposalMapping = this.p2pManager.getPeerForProposal(proposalId);
                         let targetPeer = null;
 
@@ -596,17 +801,11 @@ class ThunderdServer {
                             targetPeer = proposalMapping.peer;
                             console.log(`📋 Found peer via bidirectional mapping: ${targetPeer} (${proposalMapping.direction})`);
                         } else {
-                            console.log(`⚠️  No bidirectional mapping found for proposal ${proposalId}`);
-
-                            // Étape 2: Fallback vers l'ancienne méthode
                             const p2pProposal = this.p2pManager.getProposal(proposalId);
                             if (p2pProposal?.peer) {
                                 targetPeer = p2pProposal.peer;
                                 console.log(`📋 Found peer via P2P proposal: ${targetPeer}`);
                             } else {
-                                console.log(`⚠️  No P2P proposal found either`);
-
-                                // Étape 3: Utilise le premier peer connecté
                                 const connectedPeers = this.p2pManager.getPeers();
                                 if (connectedPeers.length > 0) {
                                     targetPeer = `${connectedPeers[0].host}:${connectedPeers[0].port}`;
@@ -625,32 +824,17 @@ class ThunderdServer {
                                 partA: channel.partA,
                                 partB: channel.partB,
                                 amount: channel.amount.toString(),
+                                network: this.detectedNetwork,
                                 timestamp: new Date().toISOString()
                             });
 
                             console.log(`✅ Successfully notified peer about channel creation`);
                         } else {
                             console.error('❌ CRITICAL: No peer found to notify about channel creation');
-                            console.error('   This means the other party will not know the channel was created');
-                            console.error('   Possible causes:');
-                            console.error('   1. Bidirectional mapping was not registered during proposal');
-                            console.error('   2. P2P proposal data was lost');
-                            console.error('   3. No peers are connected');
-                            console.error('   4. Peer disconnected after proposal');
-
-                            // Debug info
-                            console.error(`   Debug info:`);
-                            console.error(`   - Connected peers: ${this.p2pManager.getPeers().length}`);
-                            console.error(`   - Proposal mapping exists: ${!!proposalMapping}`);
-                            console.error(`   - P2P proposal exists: ${!!this.p2pManager.getProposal(proposalId)}`);
                         }
                     } catch (p2pError) {
                         console.error('❌ Failed to notify peer about channel creation:', p2pError.message);
-                        console.error('   Channel was created successfully but peer notification failed');
-                        console.error('   The other party may need to manually check: thunder-cli proposals');
                     }
-                } else {
-                    console.error('❌ P2P Manager not available for notification');
                 }
 
                 res.json({
@@ -660,21 +844,22 @@ class ThunderdServer {
                         id: channel.id,
                         address: channel.address,
                         state: channel.state,
+                        network: this.detectedNetwork,
                         needsFunding: true
                     },
-                    // Informations de debug pour le client
                     debug: {
                         proposalId: proposalId,
                         notificationSent: !!this.p2pManager && this.p2pManager.getPeers().length > 0,
                         peersConnected: this.p2pManager ? this.p2pManager.getPeers().length : 0,
-                        bidirectionalSupport: true
+                        networkType: this.detectedNetwork
                     }
                 });
             } catch (error) {
                 console.error('Create channel error:', error);
                 res.status(400).json({
                     success: false,
-                    error: error.message
+                    error: error.message,
+                    network: this.detectedNetwork
                 });
             }
         });
@@ -688,11 +873,10 @@ class ThunderdServer {
 
                 const { channelId } = req.body;
 
-                console.log(`💰 Funding channel ${channelId} by ${Utils.formatAddress(this.wallet.address)}...`);
+                console.log(`💰 Funding channel ${channelId} by ${Utils.formatAddress(this.wallet.address)} on ${this.detectedNetwork}...`);
 
                 const result = await this.channelManager.fundChannelByUser(channelId, this.wallet.address);
 
-                // Notifie les autres nodes du financement
                 if (this.p2pManager && result.funded) {
                     try {
                         await this.p2pManager.broadcastMessage('CHANNEL_FUNDED', {
@@ -700,9 +884,10 @@ class ThunderdServer {
                             userAddress: this.wallet.address,
                             bothFunded: result.bothFunded,
                             channelState: result.channelState,
+                            network: this.detectedNetwork,
                             timestamp: new Date().toISOString()
                         });
-                        console.log(`📤 Broadcasted funding notification`);
+                        console.log(`📤 Broadcasted funding notification on ${this.detectedNetwork}`);
                     } catch (p2pError) {
                         console.error('Failed to broadcast funding notification:', p2pError.message);
                     }
@@ -715,13 +900,15 @@ class ThunderdServer {
                         : 'Your part funded. Waiting for other party.',
                     funded: true,
                     bothFunded: result.bothFunded,
-                    channelState: result.channelState
+                    channelState: result.channelState,
+                    network: this.detectedNetwork
                 });
             } catch (error) {
                 console.error('Fund channel error:', error);
                 res.status(400).json({
                     success: false,
-                    error: error.message
+                    error: error.message,
+                    network: this.detectedNetwork
                 });
             }
         });
@@ -731,22 +918,24 @@ class ThunderdServer {
             try {
                 const proposals = this.channelManager ? this.channelManager.getProposals() : [];
 
-                // Sérialise les BigInt pour JSON
                 const serializedProposals = proposals.map(proposal => ({
                     ...proposal,
-                    amount: proposal.amount.toString()
+                    amount: proposal.amount.toString(),
+                    network: this.detectedNetwork
                 }));
 
                 res.json({
                     success: true,
                     proposals: serializedProposals,
+                    network: this.detectedNetwork,
                     bidirectionalSupport: true,
                     count: serializedProposals.length
                 });
             } catch (error) {
                 res.status(400).json({
                     success: false,
-                    error: error.message
+                    error: error.message,
+                    network: this.detectedNetwork
                 });
             }
         });
@@ -772,10 +961,9 @@ class ThunderdServer {
                 const amountWei = this.blockchain.web3.utils.toWei(amount, 'ether');
                 const payment = await this.channelManager.createOffChainPayment(activeChannel.id, amountWei);
 
-                // Notifie l'autre node du paiement via P2P
                 if (this.p2pManager) {
                     try {
-                        console.log(`📤 Broadcasting payment to peers...`);
+                        console.log(`📤 Broadcasting payment to peers on ${this.detectedNetwork}...`);
                         await this.p2pManager.broadcastMessage('PAYMENT', {
                             channelId: activeChannel.id,
                             paymentId: payment.id,
@@ -786,12 +974,12 @@ class ThunderdServer {
                             signature: payment.signature,
                             from: payment.from,
                             to: payment.to,
+                            network: this.detectedNetwork,
                             timestamp: payment.timestamp
                         });
-                        console.log(`✅ Payment broadcasted to peers`);
+                        console.log(`✅ Payment broadcasted to peers on ${this.detectedNetwork}`);
                     } catch (p2pError) {
                         console.error('Failed to broadcast payment:', p2pError.message);
-                        // Continue même si le P2P échoue - le paiement local est valide
                     }
                 }
 
@@ -801,20 +989,21 @@ class ThunderdServer {
                     payment: {
                         id: payment.id,
                         amount: amount,
-                        nonce: payment.nonce
+                        nonce: payment.nonce,
+                        network: this.detectedNetwork
                     }
                 });
             } catch (error) {
                 console.error('Payment error:', error);
                 res.status(400).json({
                     success: false,
-                    error: error.message
+                    error: error.message,
+                    network: this.detectedNetwork
                 });
             }
         });
 
-        // === FERMETURE & RETRAIT (CORRIGÉ AVEC SYNC P2P) ===
-
+        // === FERMETURE & RETRAIT ===
 
         this.app.post('/closechannel', async (req, res) => {
             try {
@@ -822,7 +1011,6 @@ class ThunderdServer {
                 const activeChannel = channels.find(c => c.state === 'ACTIVE');
 
                 if (!activeChannel) {
-                    // Vérifie s'il y a des channels CLOSING
                     const closingChannels = channels.filter(c => c.state === 'CLOSING');
                     if (closingChannels.length > 0) {
                         const closingChannel = closingChannels[0];
@@ -831,17 +1019,18 @@ class ThunderdServer {
                             error: `Channel ${closingChannel.id} is already in CLOSING state. It was closed by the other party. Use 'thunder-cli withdraw' after the challenge period expires.`,
                             channelState: 'CLOSING',
                             channelId: closingChannel.id,
+                            network: this.detectedNetwork,
                             suggestion: 'withdraw'
                         });
                     }
 
-                    // Vérifie s'il y a des channels CLOSED
                     const closedChannels = channels.filter(c => c.state === 'CLOSED');
                     if (closedChannels.length > 0) {
                         return res.status(400).json({
                             success: false,
                             error: `All channels are already closed. Funds have been distributed. Check your balance.`,
                             channelState: 'CLOSED',
+                            network: this.detectedNetwork,
                             suggestion: 'balance'
                         });
                     }
@@ -850,7 +1039,7 @@ class ThunderdServer {
                         channels.map(c => `${c.id}(${c.state})`).join(', '));
                 }
 
-                console.log(`🔒 Closing channel ${activeChannel.id} via API...`);
+                console.log(`🔒 Closing channel ${activeChannel.id} via API on ${this.detectedNetwork}...`);
 
                 const receipt = await this.channelManager.closeChannel(activeChannel.id);
 
@@ -859,17 +1048,19 @@ class ThunderdServer {
                     message: 'Channel closing initiated',
                     blockNumber: Number(receipt.blockNumber),
                     challengePeriod: 24,
+                    network: this.detectedNetwork,
+                    transactionHash: receipt.transactionHash,
                     p2pNotified: !!(this.channelManager && this.channelManager.p2pManager)
                 });
             } catch (error) {
                 console.error('Close channel error:', error);
 
-                // Messages d'erreur spécifiques
                 if (error.message.includes('already CLOSING')) {
                     res.status(400).json({
                         success: false,
                         error: error.message,
                         channelState: 'CLOSING',
+                        network: this.detectedNetwork,
                         suggestion: 'wait_and_withdraw',
                         nextSteps: [
                             'Wait for challenge period to expire',
@@ -882,6 +1073,7 @@ class ThunderdServer {
                         success: false,
                         error: error.message,
                         channelState: 'CLOSED',
+                        network: this.detectedNetwork,
                         suggestion: 'check_balance',
                         nextSteps: [
                             'Check your balance: thunder-cli balance',
@@ -891,7 +1083,8 @@ class ThunderdServer {
                 } else {
                     res.status(400).json({
                         success: false,
-                        error: error.message
+                        error: error.message,
+                        network: this.detectedNetwork
                     });
                 }
             }
@@ -902,39 +1095,36 @@ class ThunderdServer {
                 const channels = this.channelManager.getChannels();
                 let targetChannel = null;
 
-                // Cherche d'abord un canal CLOSING
                 targetChannel = channels.find(c => c.state === 'CLOSING');
 
                 if (!targetChannel) {
-                    // Si pas de canal CLOSING, cherche un canal CLOSED
                     targetChannel = channels.find(c => c.state === 'CLOSED');
 
                     if (targetChannel) {
-                        // Canal déjà fermé - explique la situation
                         console.log(`💳 Found CLOSED channel: ${targetChannel.id}`);
-                        console.log(`   This means the other party already withdrew funds`);
 
                         return res.json({
                             success: true,
                             message: 'Channel is already closed - funds were distributed when the other party withdrew',
                             channelId: targetChannel.id,
                             channelState: 'CLOSED',
+                            network: this.detectedNetwork,
                             status: 'already-distributed',
                             explanation: {
                                 what_happened: 'The other party withdrew first, which automatically closed the channel and distributed all funds',
                                 your_funds: 'Your THD tokens should already be in your wallet',
                                 next_step: 'Check your balance with: thunder-cli balance'
                             },
-                            p2pNotified: false // Pas besoin de notifier car déjà fermé
+                            p2pNotified: false
                         });
                     }
 
-                    // Aucun canal trouvé
                     const availableChannels = channels.map(c => `${c.id}(${c.state})`).join(', ');
                     return res.status(400).json({
                         success: false,
                         error: 'No channel available for withdrawal',
                         availableChannels: availableChannels || 'none',
+                        network: this.detectedNetwork,
                         suggestion: 'create_channel',
                         nextSteps: [
                             'Create a new channel: thunder-cli proposechannel <peer> <amount>',
@@ -943,13 +1133,10 @@ class ThunderdServer {
                     });
                 }
 
-                // Canal CLOSING trouvé - procédure normale
-                console.log(`💳 Withdrawing from CLOSING channel ${targetChannel.id} via API...`);
-                console.log(`   P2P notification will be sent automatically`);
+                console.log(`💳 Withdrawing from CLOSING channel ${targetChannel.id} via API on ${this.detectedNetwork}...`);
 
                 const result = await this.channelManager.withdrawFromChannel(targetChannel.id);
 
-                // Gestion des différents types de résultats
                 if (result.status === 'already-distributed') {
                     return res.json({
                         success: true,
@@ -957,6 +1144,7 @@ class ThunderdServer {
                         channelId: targetChannel.id,
                         transactionHash: result.transactionHash,
                         status: result.status,
+                        network: this.detectedNetwork,
                         userFinalBalance: result.userFinalBalance,
                         explanation: {
                             what_happened: 'The other party completed withdrawal first',
@@ -973,30 +1161,31 @@ class ThunderdServer {
                         message: 'No funds to withdraw - your final balance is 0 THD',
                         channelId: targetChannel.id,
                         status: result.status,
+                        network: this.detectedNetwork,
                         userFinalBalance: '0',
                         p2pNotified: false
                     });
                 }
 
-                // Withdraw normal réussi
                 res.json({
                     success: true,
                     message: 'Funds withdrawn successfully',
                     transactionHash: result.transactionHash,
                     channelId: targetChannel.id,
                     channelState: 'CLOSED',
+                    network: this.detectedNetwork,
                     p2pNotified: !!(this.channelManager && this.channelManager.p2pManager)
                 });
 
             } catch (error) {
                 console.error('Withdraw error:', error.message);
 
-                // Messages d'erreur spécifiques améliorés
                 if (error.message.includes('Challenge period not expired')) {
                     res.status(400).json({
                         success: false,
                         error: error.message,
                         channelState: 'CLOSING',
+                        network: this.detectedNetwork,
                         suggestion: 'wait_or_mine_blocks',
                         nextSteps: [
                             'Wait for the challenge period to expire naturally',
@@ -1009,6 +1198,7 @@ class ThunderdServer {
                         success: false,
                         error: 'Channel already closed and funds distributed',
                         channelState: 'CLOSED',
+                        network: this.detectedNetwork,
                         suggestion: 'check_balance',
                         explanation: 'The other party withdrew first, which automatically distributed all funds',
                         nextSteps: [
@@ -1021,6 +1211,7 @@ class ThunderdServer {
                     res.status(400).json({
                         success: false,
                         error: error.message,
+                        network: this.detectedNetwork,
                         timestamp: new Date().toISOString()
                     });
                 }
@@ -1034,7 +1225,7 @@ class ThunderdServer {
                 const message = req.body;
                 const fromPeer = message.from;
 
-                console.log(`📨 P2P message received: ${message.type} from ${fromPeer}`);
+                console.log(`📨 P2P message received: ${message.type} from ${fromPeer} on ${this.detectedNetwork}`);
 
                 if (this.p2pManager) {
                     this.p2pManager.handleMessage(message, fromPeer);
@@ -1045,23 +1236,24 @@ class ThunderdServer {
                 res.json({
                     success: true,
                     received: true,
+                    network: this.detectedNetwork,
                     timestamp: new Date().toISOString()
                 });
             } catch (error) {
                 console.error('P2P message error:', error);
                 res.status(400).json({
                     success: false,
-                    error: error.message
+                    error: error.message,
+                    network: this.detectedNetwork
                 });
             }
         });
 
         // === RÉTROCOMPATIBILITÉ ===
 
-        // Ancienne méthode openchannel (dépréciée)
         this.app.post('/openchannel', async (req, res) => {
             try {
-                console.log('⚠️  Using deprecated openchannel endpoint');
+                console.log(`⚠️  Using deprecated openchannel endpoint on ${this.detectedNetwork}`);
 
                 if (!this.wallet) {
                     throw new Error('No wallet imported');
@@ -1070,12 +1262,10 @@ class ThunderdServer {
                 const { amount = '10' } = req.body;
                 const amountWei = this.blockchain.web3.utils.toWei(amount, 'ether');
 
-                console.log(`Opening channel with ${amount} THD (${amountWei} wei) - DEPRECATED METHOD`);
+                console.log(`Opening channel with ${amount} THD (${amountWei} wei) - DEPRECATED METHOD on ${this.detectedNetwork}`);
 
-                // Pour la rétrocompatibilité, utilise l'ancienne simulation
                 const partB = "0x3C44CdDdB6a900fa2b585dd299e03d12FA4293BC";
 
-                // Crée une proposition automatique et l'accepte
                 const proposal = this.channelManager.createChannelProposal(
                     this.wallet.address,
                     partB,
@@ -1085,7 +1275,6 @@ class ThunderdServer {
                 this.channelManager.acceptChannelProposal(proposal.id, partB);
                 const channel = await this.channelManager.createChannelFromProposal(proposal.id);
 
-                // Finance automatiquement les deux parties (simulation)
                 await this.simulateBothPartiesFunding(channel.id);
 
                 res.json({
@@ -1096,14 +1285,16 @@ class ThunderdServer {
                         id: channel.id,
                         address: channel.address,
                         amount: amount,
-                        state: channel.state
+                        state: channel.state,
+                        network: this.detectedNetwork
                     }
                 });
             } catch (error) {
                 console.error('Open channel error (deprecated):', error);
                 res.status(400).json({
                     success: false,
-                    error: error.message
+                    error: error.message,
+                    network: this.detectedNetwork
                 });
             }
         });
@@ -1115,25 +1306,196 @@ class ThunderdServer {
             res.status(500).json({
                 success: false,
                 error: 'Internal server error',
+                network: this.detectedNetwork,
                 timestamp: new Date().toISOString()
             });
         });
+    }
+
+    // === MÉTHODES UTILITAIRES SPÉCIFIQUES AU RÉSEAU ===
+
+    /**
+     * Obtient les détails du réseau actuel
+     */
+    getNetworkDetails() {
+        const networkInfo = this.blockchain.getNetworkInfo();
+        const details = Utils.getNetworkInfo(networkInfo.chainId);
+        
+        return {
+            name: this.detectedNetwork,
+            chainId: networkInfo.chainId,
+            explorer: details.explorer,
+            nativeCurrency: details.nativeCurrency,
+            rpcUrl: this.rpcUrl,
+            faucets: details.faucets || [],
+            isTestnet: ['sepolia', 'localhost'].includes(this.detectedNetwork),
+            isPublic: !['localhost'].includes(this.detectedNetwork)
+        };
+    }
+
+    /**
+     * Obtient les liens d'aide selon le réseau
+     */
+    getHelpLinks() {
+        const links = {
+            localhost: {
+                docs: 'README.md',
+                setup: 'Start Hardhat: npm run node',
+                deploy: 'Deploy: npm run deploy'
+            },
+            sepolia: {
+                docs: 'SEPOLIA_SETUP.md',
+                faucet: 'https://sepoliafaucet.com/',
+                explorer: 'https://sepolia.etherscan.io/',
+                rpc: 'https://chainlist.org/chain/11155111'
+            },
+            mainnet: {
+                explorer: 'https://etherscan.io/',
+                docs: 'README.md',
+                warning: 'Use real ETH - no test funds available'
+            }
+        };
+        
+        return links[this.detectedNetwork] || links.localhost;
+    }
+
+    /**
+     * Obtient les recommandations réseau
+     */
+    getNetworkRecommendations() {
+        const recommendations = {
+            localhost: [
+                'Start Hardhat node: npm run node',
+                'Deploy contracts: npm run deploy',
+                'Use for development only'
+            ],
+            sepolia: [
+                'Get test ETH: https://sepoliafaucet.com/',
+                'Use Infura/Alchemy for better performance',
+                'Perfect for public testing'
+            ],
+            mainnet: [
+                'Use hardware wallet for security',
+                'Test thoroughly on testnet first',
+                'Monitor gas prices'
+            ]
+        };
+        
+        return recommendations[this.detectedNetwork] || [];
+    }
+
+    /**
+     * Obtient les informations d'aide pour le wallet
+     */
+    getWalletHelpInfo() {
+        if (this.detectedNetwork === 'sepolia') {
+            return {
+                testWallets: [
+                    'abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about',
+                    'test test test test test test test test test test test junk'
+                ],
+                faucet: 'https://sepoliafaucet.com/',
+                explorer: 'https://sepolia.etherscan.io/'
+            };
+        } else if (this.detectedNetwork === 'localhost') {
+            return {
+                testWallets: ['Any Hardhat default wallet'],
+                setup: 'npm run node && npm run deploy'
+            };
+        }
+        
+        return {
+            warning: 'Use only test wallets on ' + this.detectedNetwork
+        };
+    }
+
+    /**
+     * Obtient les suggestions d'erreur pour le wallet
+     */
+    getWalletErrorSuggestions(errorMessage) {
+        const suggestions = [];
+        
+        if (errorMessage.includes('not recognized')) {
+            if (this.detectedNetwork === 'sepolia') {
+                suggestions.push('Use a test seed phrase for Sepolia');
+                suggestions.push('Check deployments/sepolia-test-wallets.json');
+                suggestions.push('Deploy contracts first: npm run deploy:sepolia');
+            }
+        }
+        
+        if (errorMessage.includes('No wallet')) {
+            suggestions.push('Import a wallet first');
+            suggestions.push('Use: thunder-cli importwallet "<seed phrase>"');
+        }
+        
+        return suggestions;
+    }
+
+    /**
+     * Obtient les recommandations de balance
+     */
+    getBalanceRecommendations(ethBalance) {
+        const recommendations = [];
+        const ethNum = parseFloat(ethBalance);
+        
+        if (this.detectedNetwork === 'sepolia' && ethNum < 0.001) {
+            recommendations.push('Low ETH balance for gas fees');
+            recommendations.push('Get test ETH: https://sepoliafaucet.com/');
+        } else if (this.detectedNetwork === 'mainnet' && ethNum < 0.01) {
+            recommendations.push('Consider getting more ETH for gas fees');
+        }
+        
+        return recommendations;
+    }
+
+    /**
+     * Obtient les suggestions d'erreur de balance
+     */
+    getBalanceErrorSuggestions(errorMessage) {
+        const suggestions = [];
+        
+        if (errorMessage.includes('not available')) {
+            suggestions.push('Deploy contracts first');
+            if (this.detectedNetwork === 'sepolia') {
+                suggestions.push('npm run deploy:sepolia');
+            } else {
+                suggestions.push('npm run deploy');
+            }
+        }
+        
+        return suggestions;
+    }
+
+    /**
+     * Obtient les suggestions d'erreur de connexion
+     */
+    getConnectionErrorSuggestions(errorMessage) {
+        const suggestions = [];
+        
+        if (errorMessage.includes('connect')) {
+            suggestions.push('Check if peer is running');
+            suggestions.push('Verify network connectivity');
+            if (this.detectedNetwork !== 'localhost') {
+                suggestions.push('Ensure firewall allows connections');
+                suggestions.push('Check if peer port is open');
+            }
+        }
+        
+        return suggestions;
     }
 
     // === SOCKET.IO HANDLERS ===
 
     setupSocketHandlers() {
         this.io.on('connection', (socket) => {
-            console.log(`🔌 Socket connected: ${socket.id}`);
+            console.log(`🔌 Socket connected: ${socket.id} on ${this.detectedNetwork}`);
 
             socket.on('disconnect', () => {
                 console.log(`🔌 Socket disconnected: ${socket.id}`);
             });
 
-            // Gestion des messages peer-to-peer
             socket.on('peer-message', (data) => {
-                console.log('📨 Peer message received:', data);
-                // Broadcast vers les autres peers
+                console.log(`📨 Peer message received on ${this.detectedNetwork}:`, data);
                 socket.broadcast.emit('peer-message', data);
             });
         });
@@ -1153,137 +1515,21 @@ class ThunderdServer {
         return result;
     }
 
-    handleChannelWithdrawn(data, fromPeer) {
-        console.log(`\n💳 ===== CHANNEL WITHDRAW NOTIFICATION RECEIVED =====`);
-        console.log(`   From peer: ${fromPeer}`);
-        console.log(`   Timestamp: ${new Date().toLocaleString()}`);
-
-        const {
-            channelId,
-            channelAddress,
-            withdrawnBy,
-            userRole,
-            withdrawnAmount,
-            transactionHash,
-            blockNumber,
-            partA,
-            partB,
-            finalBalanceA,
-            finalBalanceB,
-            channelNowClosed
-        } = data;
-
-        console.log(`📋 Withdraw notification details:`);
-        console.log(`   Channel ID: ${channelId}`);
-        console.log(`   Channel Address: ${Utils.formatAddress(channelAddress)}`);
-        console.log(`   Withdrawn by: ${Utils.formatAddress(withdrawnBy)} (${userRole})`);
-        console.log(`   Amount withdrawn: ${Utils.formatBalance(BigInt(withdrawnAmount))} THD`);
-        console.log(`   Transaction: ${transactionHash}`);
-        console.log(`   Block: ${blockNumber}`);
-        console.log(`   Channel now closed: ${channelNowClosed}`);
-
-        // === SYNCHRONISATION CRITIQUE ===
-
-        if (!this.server.channelManager) {
-            console.log(`❌ Channel manager not available for synchronization`);
-            return;
-        }
-
-        const channel = this.server.channelManager.channels.get(channelId);
-        if (!channel) {
-            console.log(`⚠️  Channel ${channelId} not found locally`);
-            console.log(`   This might be expected if you weren't a participant`);
-            return;
-        }
-
-        // Vérifie que l'utilisateur actuel est participant
-        const currentUserAddress = this.server.wallet?.address?.toLowerCase();
-        if (!currentUserAddress) {
-            console.log(`⚠️  No wallet loaded for validation`);
-            return;
-        }
-
-        const isParticipant = currentUserAddress === partA.toLowerCase() ||
-            currentUserAddress === partB.toLowerCase();
-
-        if (!isParticipant) {
-            console.log(`ℹ️  Withdraw notification not relevant (current user not a participant)`);
-            console.log(`   Current user: ${Utils.formatAddress(currentUserAddress)}`);
-            return;
-        }
-
-        console.log(`✅ Withdraw notification relevant - user is participant`);
-        console.log(`   Current user: ${Utils.formatAddress(currentUserAddress)}`);
-        console.log(`   Participant role: ${currentUserAddress === partA.toLowerCase() ? 'Part A' : 'Part B'}`);
-
-        // === SYNCHRONISATION D'ÉTAT VERS CLOSED ===
-
-        console.log(`🔄 Synchronizing channel to CLOSED state...`);
-        console.log(`   Current state: ${channel.state}`);
-
-        try {
-            const previousState = channel.state;
-
-            // === SYNCHRONISATION CRITIQUE VERS CLOSED ===
-            channel.state = 'CLOSED';
-            channel.balanceA = BigInt(finalBalanceA);
-            channel.balanceB = BigInt(finalBalanceB);
-            channel.lastUpdate = new Date().toISOString();
-
-            console.log(`✅ Channel state synchronized successfully`);
-            console.log(`   State: ${previousState} → CLOSED`);
-            console.log(`   Final balances: A=${Utils.formatBalance(channel.balanceA)}, B=${Utils.formatBalance(channel.balanceB)}`);
-
-            // Affiche l'information pour l'utilisateur actuel
-            const isCurrentUserPartA = currentUserAddress === partA.toLowerCase();
-            const otherWithdrew = withdrawnBy.toLowerCase() !== currentUserAddress;
-
-            if (otherWithdrew) {
-                console.log(`\n💰 Other party withdraw summary:`);
-                console.log(`   ${Utils.formatAddress(withdrawnBy)} (${userRole}) withdrew ${Utils.formatBalance(BigInt(withdrawnAmount))} THD`);
-                console.log(`   Channel is now CLOSED on blockchain`);
-
-                // Vérifie si l'utilisateur actuel peut aussi retirer
-                const userFinalBalance = isCurrentUserPartA ? channel.balanceA : channel.balanceB;
-
-                if (userFinalBalance > 0) {
-                    console.log(`\n🎯 YOU CAN NOW WITHDRAW!`);
-                    console.log(`========================`);
-                    console.log(`Your final balance: ${Utils.formatBalance(userFinalBalance)} THD`);
-                    console.log(`The channel is now CLOSED and you can withdraw immediately.`);
-                    console.log(`\n💎 Use: thunder-cli withdraw`);
-                } else {
-                    console.log(`\n📊 Your final balance: ${Utils.formatBalance(userFinalBalance)} THD (nothing to withdraw)`);
-                }
-            }
-
-        } catch (syncError) {
-            console.error(`❌ Failed to synchronize channel state:`, syncError.message);
-            console.error(`   Withdraw notification received but local sync failed`);
-        }
-
-        console.log(`===== CHANNEL WITHDRAW NOTIFICATION PROCESSED =====\n`);
-    }
-
     /**
      * Simulation du financement des deux parties (pour rétrocompatibilité)
      */
     async simulateBothPartiesFunding(channelId) {
         try {
-            console.log('🔄 Simulating both parties funding (deprecated method)...');
+            console.log(`🔄 Simulating both parties funding (deprecated method) on ${this.detectedNetwork}...`);
 
-            // Finance Part A (utilisateur actuel)
             await this.channelManager.fundChannelByUser(channelId, this.wallet.address);
 
-            // Simule le financement de Part B
             const channel = this.channelManager.channels.get(channelId);
             const partBKey = "0x5de4111afa1a4b94908f83103eb1f1706367c2e68ca870fc3fb9a804cdab365a";
             const partBAccount = this.blockchain.web3.eth.accounts.privateKeyToAccount(partBKey);
 
-            // Ajoute Part B au wallet
             this.blockchain.web3.eth.accounts.wallet.add(partBAccount);
 
-            // Approve et finance Part B
             const fundAmount = channel.amount / BigInt(2);
             const thdAbi = require('../../artifacts/contracts/THDToken.sol/THDToken.json').abi;
             const thdContract = new this.blockchain.web3.eth.Contract(
@@ -1291,46 +1537,31 @@ class ThunderdServer {
                 this.blockchain.deploymentInfo.thdToken
             );
 
-            // Part B approve les tokens pour le channel
             await thdContract.methods.approve(channel.address, fundAmount.toString()).send({
                 from: partBAccount.address,
                 gas: 100000
             });
 
-            console.log(`💰 Part B approved ${Utils.formatBalance(fundAmount)} THD for channel`);
-
-            // Part B finance le channel
             await channel.contract.methods.fund().send({
                 from: partBAccount.address,
                 gas: 200000
             });
 
-            console.log(`💰 Part B funded ${Utils.formatBalance(fundAmount)} THD to channel`);
+            console.log(`💰 Part B funded ${Utils.formatBalance(fundAmount)} THD to channel on ${this.detectedNetwork}`);
 
-            // Met à jour l'état local du financement
             const funding = this.channelManager.userFunding.get(channelId);
             funding[partBAccount.address.toLowerCase()] = true;
 
-            console.log(`✅ Updated funding tracking for Part B`);
-
-            // Vérifie l'état final du channel sur la blockchain
             const channelInfo = await channel.contract.methods.getChannelInfo().call();
             const newState = this.channelManager.mapContractState(channelInfo._state);
 
-            // Met à jour l'état local du channel
             channel.state = newState;
             channel.lastUpdate = new Date().toISOString();
 
-            console.log(`📊 Channel state updated: ${newState}`);
-            console.log(`   Contract balanceA: ${Utils.formatBalance(BigInt(channelInfo._balanceA))}`);
-            console.log(`   Contract balanceB: ${Utils.formatBalance(BigInt(channelInfo._balanceB))}`);
-            console.log(`   Contract amount: ${Utils.formatBalance(BigInt(channelInfo._amount))}`);
+            console.log(`📊 Channel state updated: ${newState} on ${this.detectedNetwork}`);
 
             if (newState === 'ACTIVE') {
-                console.log('✅ Both parties funding simulated successfully - Channel ACTIVE');
-                console.log(`🎉 Channel ${channelId} is ready for payments!`);
-            } else {
-                console.log(`⚠️  Channel state is ${newState}, expected ACTIVE`);
+                console.log(`✅ Both parties funding simulated successfully - Channel ACTIVE on ${this.detectedNetwork}`);
             }
 
             return {
@@ -1340,40 +1571,59 @@ class ThunderdServer {
             };
 
         } catch (error) {
-            console.error('❌ Failed to simulate both parties funding:', error.message);
-            console.error('   Error details:', error);
-
-            // Essaie de nettoyer en cas d'erreur partielle
-            try {
-                const channel = this.channelManager.channels.get(channelId);
-                if (channel) {
-                    console.log('🧹 Attempting to clean up partial funding...');
-                    // Remet l'état à EMPTY si la simulation a échoué
-                    channel.state = 'EMPTY';
-                    channel.lastUpdate = new Date().toISOString();
-                }
-            } catch (cleanupError) {
-                console.error('⚠️  Failed to cleanup after funding error:', cleanupError.message);
-            }
-
+            console.error(`❌ Failed to simulate both parties funding on ${this.detectedNetwork}:`, error.message);
             throw error;
         }
     }
 
-    // === STARTUP CRITIQUE AVEC INJECTION P2P ET SUPPORT BIDIRECTIONNEL ===
+    // === STARTUP AVEC SUPPORT MULTI-RÉSEAU ===
 
     async start() {
         try {
             console.log('⚡ Thunder Payment Channel Node');
             console.log('================================');
-            console.log(`Version: 1.0.0-bidirectional`);
+            console.log(`Version: 1.0.0-sepolia`);
             console.log(`Port: ${this.port}`);
+            console.log(`RPC: ${this.rpcUrl}`);
+            console.log(`Network: ${this.detectedNetwork.toUpperCase()}`);
             console.log('');
+
+            // Vérifications spécifiques selon le réseau
+            if (this.detectedNetwork === 'sepolia') {
+                console.log('🌐 Sepolia Network Configuration');
+                console.log('================================');
+                
+                if (!process.env.SEPOLIA_RPC_URL && this.rpcUrl.includes('127.0.0.1')) {
+                    console.log('⚠️  Using localhost RPC but Sepolia network specified');
+                    console.log('💡 Set SEPOLIA_RPC_URL in .env or use --rpc flag');
+                }
+                
+                console.log('🔗 Useful Sepolia links:');
+                console.log('   🚰 Faucet: https://sepoliafaucet.com/');
+                console.log('   🔍 Explorer: https://sepolia.etherscan.io/');
+                console.log('   📚 RPC List: https://chainlist.org/chain/11155111');
+                console.log('');
+            } else if (this.detectedNetwork === 'localhost') {
+                console.log('💻 Local Development Configuration');
+                console.log('==================================');
+                console.log('   Ensure Hardhat node is running: npm run node');
+                console.log('   Deploy contracts: npm run deploy');
+                console.log('');
+            } else if (this.detectedNetwork === 'mainnet') {
+                console.log('🚨 MAINNET CONFIGURATION');
+                console.log('========================');
+                console.log('⚠️  You are connecting to MAINNET - use real ETH!');
+                console.log('   Ensure you have tested thoroughly on testnet');
+                console.log('   Use hardware wallet for security');
+                console.log('');
+            }
 
             // === ÉTAPE 1: INITIALISATION BLOCKCHAIN ===
             console.log('🔗 Step 1: Initializing blockchain connection...');
             await this.blockchain.initialize();
-            console.log('✅ Blockchain initialized');
+            
+            this.networkInfo = this.blockchain.getNetworkInfo();
+            console.log(`✅ Connected to ${this.networkInfo.network.toUpperCase()}`);
 
             // === ÉTAPE 2: INITIALISATION CHANNEL MANAGER ===
             console.log('📋 Step 2: Initializing channel manager...');
@@ -1383,45 +1633,24 @@ class ThunderdServer {
             // === ÉTAPE 3: INITIALISATION P2P MANAGER ===
             console.log('📡 Step 3: Initializing P2P manager...');
             this.p2pManager = new P2PManager(this, this.port);
-            console.log('✅ P2P manager initialized with bidirectional support');
+            console.log('✅ P2P manager initialized');
 
-            // === ÉTAPE 4: INJECTION P2P DANS CHANNEL MANAGER (CRITIQUE!!!) ===
+            // === ÉTAPE 4: INJECTION P2P ===
             console.log('🔗 Step 4: Injecting P2P manager into channel manager...');
-            console.log('   THIS IS CRITICAL FOR CHANNEL CLOSURE SYNCHRONIZATION');
-
-            if (!this.channelManager) {
-                throw new Error('ChannelManager not initialized');
-            }
-
-            if (!this.p2pManager) {
-                throw new Error('P2PManager not initialized');
-            }
-
-            // INJECTION CRITIQUE
             this.channelManager.setP2PManager(this.p2pManager);
-
-            // VÉRIFICATION DE L'INJECTION
+            
             if (this.channelManager.p2pManager) {
-                console.log('✅ P2P Manager successfully injected into ChannelManager');
+                console.log('✅ P2P Manager successfully injected');
                 console.log('🔄 Channel closure synchronization: ENABLED');
-                console.log('   When a channel is closed, peers will be automatically notified');
             } else {
-                console.error('❌ CRITICAL ERROR: P2P Manager injection FAILED');
-                console.error('⚠️  Channel closure synchronization will NOT work');
-                console.error('   Channels closed on one node will not update on other nodes');
-                throw new Error('Critical: P2P Manager injection failed - synchronization broken');
+                throw new Error('Critical: P2P Manager injection failed');
             }
 
             // === ÉTAPE 5: VÉRIFICATION SUPPORT BIDIRECTIONNEL ===
             console.log('🔄 Step 5: Verifying bidirectional support...');
-
             if (this.p2pManager.proposalToPeerMap && this.p2pManager.peerToProposalsMap) {
                 console.log('✅ Bidirectional proposal mapping: ENABLED');
-                console.log('   • proposalId ↔ peerAddress mapping: ACTIVE');
-                console.log('   • Peer cleanup on disconnect: ACTIVE');
-                console.log('   • Resolution cascade: ACTIVE');
             } else {
-                console.error('❌ CRITICAL ERROR: Bidirectional mapping NOT initialized');
                 throw new Error('Critical: Bidirectional proposal support missing');
             }
 
@@ -1430,43 +1659,73 @@ class ThunderdServer {
             this.server.listen(this.port, () => {
                 console.log('\n🎉 Thunder Node Successfully Started!');
                 console.log('=====================================');
-                console.log(`🌐 HTTP Server: http://localhost:${this.port}`);
+                console.log(`🌐 Network: ${this.networkInfo.network.toUpperCase()}`);
+                console.log(`🔗 HTTP Server: http://localhost:${this.port}`);
                 console.log(`🔌 Socket.IO: ws://localhost:${this.port}`);
                 console.log(`📡 P2P Port: ${this.port}`);
+                
+                if (this.networkInfo.explorer) {
+                    console.log(`🔍 Explorer: ${this.networkInfo.explorer}`);
+                }
+                
                 console.log('');
                 console.log('🔧 System Status:');
-                console.log(`   ✅ Blockchain: Connected`);
+                console.log(`   ✅ Blockchain: Connected to ${this.networkInfo.network}`);
                 console.log(`   ✅ Channel Manager: Ready`);
                 console.log(`   ✅ P2P Manager: Ready`);
                 console.log(`   ✅ P2P Injection: Success`);
                 console.log(`   ✅ Channel Sync: Enabled`);
                 console.log(`   ✅ Bidirectional Proposals: Enabled`);
-                console.log(`   ✅ Proposal Mapping: Active`);
+                console.log(`   ✅ Multi-Network Support: Enabled`);
                 console.log('');
-                console.log('💡 Ready for bidirectional operations!');
-                console.log('======================================');
-                console.log('Supported workflows:');
-                console.log('  • A → B proposals and creation ✅');
-                console.log('  • B → A proposals and creation ✅');
-                console.log('  • Automatic peer resolution ✅');
-                console.log('  • Channel closure sync ✅');
-                console.log('');
-                console.log('Next steps:');
-                console.log('  1. Import wallet: thunder-cli importwallet "<seed phrase>"');
-                console.log('  2. Connect to peer: thunder-cli connect <ip:port>');
-                console.log('  3. Propose channel: thunder-cli proposechannel <peer> <amount>');
-                console.log('  4. ANY NODE can propose to ANY OTHER NODE!');
+                
+                // Instructions spécifiques selon le réseau
+                if (this.detectedNetwork === 'sepolia') {
+                    console.log('🎯 Ready for Sepolia testing!');
+                    console.log('=============================');
+                    console.log('Your node is now connected to the Sepolia testnet.');
+                    console.log('Others can connect to you from anywhere in the world!');
+                    console.log('');
+                    console.log('📋 Next steps for global testing:');
+                    console.log('1. Import a test wallet:');
+                    console.log('   thunder-cli importwallet "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about"');
+                    console.log('');
+                    console.log('2. Share your public IP with testers:');
+                    console.log('   • Find your IP: curl ifconfig.me');
+                    console.log('   • Open port in router/firewall');
+                    console.log('   • Share: <YOUR_PUBLIC_IP>:' + this.port);
+                    console.log('');
+                    console.log('3. Connect with other testers worldwide:');
+                    console.log('   thunder-cli connect <THEIR_IP>:2001');
+                    console.log('');
+                    console.log('4. Create payment channels:');
+                    console.log('   thunder-cli proposechannel <THEIR_IP>:2001 10');
+                    console.log('');
+                    console.log('🌍 Global testing enabled! 🚀');
+                    
+                } else if (this.detectedNetwork === 'localhost') {
+                    console.log('💻 Ready for local development!');
+                    console.log('===============================');
+                    console.log('1. Import wallet: thunder-cli importwallet "<seed phrase>"');
+                    console.log('2. Start second node: thunderd --port 2002');
+                    console.log('3. Connect nodes: thunder-cli connect localhost:2002');
+                    console.log('4. Create channels: thunder-cli proposechannel localhost:2002 10');
+                    
+                } else if (this.detectedNetwork === 'mainnet') {
+                    console.log('🚨 MAINNET MODE - REAL MONEY!');
+                    console.log('=============================');
+                    console.log('⚠️  You are on MAINNET - all transactions use real ETH!');
+                    console.log('💡 Ensure thorough testing on testnet first');
+                    console.log('🔒 Use hardware wallet for security');
+                    console.log('📊 Monitor gas prices carefully');
+                }
+                
                 console.log('');
                 console.log('🔍 Debug endpoints:');
                 console.log(`  - System info: curl http://localhost:${this.port}/debug/system`);
+                console.log(`  - Network info: curl http://localhost:${this.port}/debug/network`);
                 console.log(`  - Channels: curl http://localhost:${this.port}/debug/channels`);
-                console.log(`  - P2P & mappings: curl http://localhost:${this.port}/debug/p2p`);
-                console.log('');
-                console.log('🧪 Test bidirectional functionality:');
-                console.log('  • Start two nodes on different ports');
-                console.log('  • Connect them bidirectionally');
-                console.log('  • Either node can propose to the other');
-                console.log('  • Both proposals will work correctly!');
+                console.log(`  - P2P status: curl http://localhost:${this.port}/debug/p2p`);
             });
 
             return true;
@@ -1475,28 +1734,35 @@ class ThunderdServer {
             console.error('==================================');
             console.error(`Error: ${error.message}`);
             console.error('');
-            console.error('💡 Troubleshooting checklist:');
-            console.error('   1. ✓ Hardhat node running: npm run node');
-            console.error('   2. ✓ Contracts deployed: npm run deploy');
-            console.error('   3. ✓ Port available and not in use');
-            console.error('   4. ✓ No firewall blocking the port');
-            console.error('   5. ✓ Sufficient disk space');
-            console.error('');
-            console.error('🔧 Quick fixes:');
-            console.error('   - Kill existing processes: pkill -f thunderd');
-            console.error('   - Check port usage: lsof -i :' + this.port);
-            console.error('   - Restart blockchain: npm run node');
-            console.error('   - Redeploy contracts: npm run deploy');
-            console.error('');
-            console.error('🚨 If P2P injection failed:');
-            console.error('   - Ensure ChannelManager.setP2PManager() method exists');
-            console.error('   - Check that p2pManager property is set correctly');
-            console.error('   - Verify no circular dependencies in modules');
-            console.error('');
-            console.error('🚨 If bidirectional support failed:');
-            console.error('   - Ensure P2PManager has proposalToPeerMap and peerToProposalsMap');
-            console.error('   - Check registerProposalPeer() method exists');
-            console.error('   - Verify getPeerForProposal() method exists');
+            
+            // Instructions spécifiques selon l'erreur et le réseau
+            if (error.message.includes('connect') && this.rpcUrl) {
+                console.error('💡 RPC Connection issues:');
+                console.error(`   - Check RPC URL: ${this.rpcUrl}`);
+                console.error('   - Verify internet connection');
+                
+                if (this.detectedNetwork === 'sepolia') {
+                    console.error('   - Verify Sepolia RPC endpoint');
+                    console.error('   - Check Infura/Alchemy API key');
+                    console.error('   - Try: thunderd --rpc https://rpc.sepolia.org');
+                } else if (this.detectedNetwork === 'localhost') {
+                    console.error('   - Start Hardhat node: npm run node');
+                }
+            } else if (error.message.includes('deployment')) {
+                console.error('💡 Deployment issues:');
+                if (this.detectedNetwork === 'sepolia') {
+                    console.error('   - Deploy contracts: npm run deploy:sepolia');
+                    console.error('   - Check .env configuration');
+                    console.error('   - Get test ETH: https://sepoliafaucet.com/');
+                } else {
+                    console.error('   - Deploy contracts: npm run deploy');
+                    console.error('   - Start Hardhat: npm run node');
+                }
+            } else if (error.message.includes('injection')) {
+                console.error('💡 P2P injection failed:');
+                console.error('   - Check ChannelManager.setP2PManager() method');
+                console.error('   - Verify no circular dependencies');
+            }
 
             throw error;
         }
