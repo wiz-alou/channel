@@ -900,42 +900,130 @@ class ThunderdServer {
         this.app.post('/withdraw', async (req, res) => {
             try {
                 const channels = this.channelManager.getChannels();
-                const closingChannel = channels.find(c => c.state === 'CLOSING');
+                let targetChannel = null;
 
-                if (!closingChannel) {
-                    // Vérifie s'il y a des channels déjà CLOSED
-                    const closedChannels = channels.filter(c => c.state === 'CLOSED');
-                    if (closedChannels.length > 0) {
-                        return res.status(400).json({
-                            success: false,
-                            error: `All channels are already closed and funds withdrawn. Check your balance.`,
+                // Cherche d'abord un canal CLOSING
+                targetChannel = channels.find(c => c.state === 'CLOSING');
+
+                if (!targetChannel) {
+                    // Si pas de canal CLOSING, cherche un canal CLOSED
+                    targetChannel = channels.find(c => c.state === 'CLOSED');
+
+                    if (targetChannel) {
+                        // Canal déjà fermé - explique la situation
+                        console.log(`💳 Found CLOSED channel: ${targetChannel.id}`);
+                        console.log(`   This means the other party already withdrew funds`);
+
+                        return res.json({
+                            success: true,
+                            message: 'Channel is already closed - funds were distributed when the other party withdrew',
+                            channelId: targetChannel.id,
                             channelState: 'CLOSED',
-                            suggestion: 'balance'
+                            status: 'already-distributed',
+                            explanation: {
+                                what_happened: 'The other party withdrew first, which automatically closed the channel and distributed all funds',
+                                your_funds: 'Your THD tokens should already be in your wallet',
+                                next_step: 'Check your balance with: thunder-cli balance'
+                            },
+                            p2pNotified: false // Pas besoin de notifier car déjà fermé
                         });
                     }
 
-                    throw new Error('No closing channel found. Available channels: ' +
-                        channels.map(c => `${c.id}(${c.state})`).join(', '));
+                    // Aucun canal trouvé
+                    const availableChannels = channels.map(c => `${c.id}(${c.state})`).join(', ');
+                    return res.status(400).json({
+                        success: false,
+                        error: 'No channel available for withdrawal',
+                        availableChannels: availableChannels || 'none',
+                        suggestion: 'create_channel',
+                        nextSteps: [
+                            'Create a new channel: thunder-cli proposechannel <peer> <amount>',
+                            'Or check your balance: thunder-cli balance'
+                        ]
+                    });
                 }
 
-                console.log(`💳 Withdrawing from channel ${closingChannel.id} via API...`);
+                // Canal CLOSING trouvé - procédure normale
+                console.log(`💳 Withdrawing from CLOSING channel ${targetChannel.id} via API...`);
                 console.log(`   P2P notification will be sent automatically`);
 
-                const receipt = await this.channelManager.withdrawFromChannel(closingChannel.id);
+                const result = await this.channelManager.withdrawFromChannel(targetChannel.id);
 
+                // Gestion des différents types de résultats
+                if (result.status === 'already-distributed') {
+                    return res.json({
+                        success: true,
+                        message: 'Funds were already distributed when the other party withdrew',
+                        channelId: targetChannel.id,
+                        transactionHash: result.transactionHash,
+                        status: result.status,
+                        userFinalBalance: result.userFinalBalance,
+                        explanation: {
+                            what_happened: 'The other party completed withdrawal first',
+                            your_funds: 'Your tokens were automatically distributed to your wallet',
+                            check_balance: 'thunder-cli balance'
+                        },
+                        p2pNotified: false
+                    });
+                }
+
+                if (result.status === 'no-funds') {
+                    return res.json({
+                        success: true,
+                        message: 'No funds to withdraw - your final balance is 0 THD',
+                        channelId: targetChannel.id,
+                        status: result.status,
+                        userFinalBalance: '0',
+                        p2pNotified: false
+                    });
+                }
+
+                // Withdraw normal réussi
                 res.json({
                     success: true,
                     message: 'Funds withdrawn successfully',
-                    transactionHash: receipt.transactionHash,
-                    channelId: closingChannel.id,
+                    transactionHash: result.transactionHash,
+                    channelId: targetChannel.id,
+                    channelState: 'CLOSED',
                     p2pNotified: !!(this.channelManager && this.channelManager.p2pManager)
                 });
+
             } catch (error) {
                 console.error('Withdraw error:', error.message);
-                res.status(400).json({
-                    success: false,
-                    error: error.message
-                });
+
+                // Messages d'erreur spécifiques améliorés
+                if (error.message.includes('Challenge period not expired')) {
+                    res.status(400).json({
+                        success: false,
+                        error: error.message,
+                        channelState: 'CLOSING',
+                        suggestion: 'wait_or_mine_blocks',
+                        nextSteps: [
+                            'Wait for the challenge period to expire naturally',
+                            'Or speed up with: npm run mine-blocks 25',
+                            'Then try again: thunder-cli withdraw'
+                        ]
+                    });
+                } else if (error.message.includes('already CLOSED')) {
+                    res.status(400).json({
+                        success: false,
+                        error: 'Channel already closed and funds distributed',
+                        channelState: 'CLOSED',
+                        suggestion: 'check_balance',
+                        explanation: 'The other party withdrew first, which automatically distributed all funds',
+                        nextSteps: [
+                            'Check your balance: thunder-cli balance',
+                            'Your THD tokens should be in your wallet',
+                            'No further action needed'
+                        ]
+                    });
+                } else {
+                    res.status(400).json({
+                        success: false,
+                        error: error.message,
+                        timestamp: new Date().toISOString()
+                    });
+                }
             }
         });
 

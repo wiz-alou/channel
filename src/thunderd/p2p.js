@@ -66,6 +66,10 @@ class P2PManager {
             this.handleChannelAccepted(data, fromPeer);
         });
 
+        this.messageHandlers.set('CHANNEL_WITHDRAWN', (data, fromPeer) => {
+            this.handleChannelWithdrawn(data, fromPeer);
+        });
+
         // Channel créé
         this.messageHandlers.set('CHANNEL_CREATED', (data, fromPeer) => {
             this.handleChannelCreated(data, fromPeer);
@@ -515,6 +519,117 @@ class P2PManager {
         }
 
         console.log(`💡 To accept: thunder-cli acceptchannel ${id}`);
+    }
+
+    handleChannelWithdrawn(data, fromPeer) {
+        console.log(`\n💳 ===== CHANNEL WITHDRAW NOTIFICATION RECEIVED =====`);
+        console.log(`   From peer: ${fromPeer}`);
+        console.log(`   Timestamp: ${new Date().toLocaleString()}`);
+
+        const {
+            channelId,
+            channelAddress,
+            withdrawnBy,
+            userRole,
+            withdrawnAmount,
+            transactionHash,
+            blockNumber,
+            partA,
+            partB,
+            finalBalanceA,
+            finalBalanceB,
+            channelNowClosed
+        } = data;
+
+        console.log(`📋 Withdraw notification details:`);
+        console.log(`   Channel ID: ${channelId}`);
+        console.log(`   Channel Address: ${Utils.formatAddress(channelAddress)}`);
+        console.log(`   Withdrawn by: ${Utils.formatAddress(withdrawnBy)} (${userRole})`);
+        console.log(`   Amount withdrawn: ${Utils.formatBalance(BigInt(withdrawnAmount))} THD`);
+        console.log(`   Transaction: ${transactionHash}`);
+        console.log(`   Block: ${blockNumber}`);
+        console.log(`   Channel now closed: ${channelNowClosed}`);
+
+        // === SYNCHRONISATION CRITIQUE ===
+        if (!this.server.channelManager) {
+            console.log(`❌ Channel manager not available for synchronization`);
+            return;
+        }
+
+        const channel = this.server.channelManager.channels.get(channelId);
+        if (!channel) {
+            console.log(`⚠️  Channel ${channelId} not found locally`);
+            console.log(`   This might be expected if you weren't a participant`);
+            return;
+        }
+
+        // Vérifie que l'utilisateur actuel est participant
+        const currentUserAddress = this.server.wallet?.address?.toLowerCase();
+        if (!currentUserAddress) {
+            console.log(`⚠️  No wallet loaded for validation`);
+            return;
+        }
+
+        const isParticipant = currentUserAddress === partA.toLowerCase() ||
+            currentUserAddress === partB.toLowerCase();
+
+        if (!isParticipant) {
+            console.log(`ℹ️  Withdraw notification not relevant (current user not a participant)`);
+            console.log(`   Current user: ${Utils.formatAddress(currentUserAddress)}`);
+            return;
+        }
+
+        console.log(`✅ Withdraw notification relevant - user is participant`);
+        console.log(`   Current user: ${Utils.formatAddress(currentUserAddress)}`);
+        console.log(`   Participant role: ${currentUserAddress === partA.toLowerCase() ? 'Part A' : 'Part B'}`);
+
+        // === SYNCHRONISATION D'ÉTAT VERS CLOSED ===
+        console.log(`🔄 Synchronizing channel to CLOSED state...`);
+        console.log(`   Current state: ${channel.state}`);
+
+        try {
+            const previousState = channel.state;
+
+            // === SYNCHRONISATION CRITIQUE VERS CLOSED ===
+            channel.state = 'CLOSED';
+            channel.balanceA = BigInt(finalBalanceA);
+            channel.balanceB = BigInt(finalBalanceB);
+            channel.lastUpdate = new Date().toISOString();
+
+            console.log(`✅ Channel state synchronized successfully`);
+            console.log(`   State: ${previousState} → CLOSED`);
+            console.log(`   Final balances: A=${Utils.formatBalance(channel.balanceA)}, B=${Utils.formatBalance(channel.balanceB)}`);
+
+            // Affiche l'information pour l'utilisateur actuel
+            const isCurrentUserPartA = currentUserAddress === partA.toLowerCase();
+            const otherWithdrew = withdrawnBy.toLowerCase() !== currentUserAddress;
+
+            if (otherWithdrew) {
+                console.log(`\n💰 Other party withdraw summary:`);
+                console.log(`   ${Utils.formatAddress(withdrawnBy)} (${userRole}) withdrew ${Utils.formatBalance(BigInt(withdrawnAmount))} THD`);
+                console.log(`   Channel is now CLOSED on blockchain`);
+
+                // Vérifie si l'utilisateur actuel peut aussi retirer
+                const userFinalBalance = isCurrentUserPartA ? channel.balanceA : channel.balanceB;
+
+                if (userFinalBalance > 0) {
+                    console.log(`\n🎯 YOUR FUNDS ARE READY!`);
+                    console.log(`========================`);
+                    console.log(`Your final balance: ${Utils.formatBalance(userFinalBalance)} THD`);
+                    console.log(`The other party has withdrawn and the channel is CLOSED.`);
+                    console.log(`Your funds are now in your wallet automatically.`);
+                    console.log(`\n💎 Check balance: thunder-cli balance`);
+                } else {
+                    console.log(`\n📊 Your final balance: ${Utils.formatBalance(userFinalBalance)} THD (nothing to withdraw)`);
+                }
+            }
+
+        } catch (syncError) {
+            console.error(`❌ Failed to synchronize channel state:`, syncError.message);
+            console.error(`   Withdraw notification received but local sync failed`);
+        }
+
+        console.log(`===== CHANNEL WITHDRAW NOTIFICATION PROCESSED =====\n`);
     }
 
     /**

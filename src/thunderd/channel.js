@@ -684,17 +684,60 @@ class ChannelManager {
                 throw new Error('Channel not found');
             }
 
+            // === NOUVELLE LOGIQUE: Gestion des états CLOSING et CLOSED ===
+
+            if (channel.state === 'CLOSED') {
+                // Le canal est déjà fermé - vérifier les balances
+                console.log(`💳 Channel ${channelId} is already CLOSED`);
+                console.log(`   This means the other party has already withdrawn funds`);
+
+                // Vérifie les balances finales
+                const currentUserAddress = this.blockchain.currentAccount.address.toLowerCase();
+                const isPartA = currentUserAddress === channel.partA.toLowerCase();
+                const userFinalBalance = isPartA ? channel.balanceA : channel.balanceB;
+
+                console.log(`💰 Your final balance in closed channel: ${Utils.formatBalance(userFinalBalance)} THD`);
+
+                if (userFinalBalance > 0) {
+                    // IMPORTANT: Dans un vrai système, les fonds seraient déjà distribués
+                    // Ici on simule juste le message pour l'utilisateur
+                    console.log(`\n🎉 GOOD NEWS!`);
+                    console.log(`=============`);
+                    console.log(`Your ${Utils.formatBalance(userFinalBalance)} THD should already be in your wallet.`);
+                    console.log(`The other party withdrew first, which automatically distributed all funds.`);
+                    console.log(`\n💎 Check your balance: thunder-cli balance`);
+
+                    // Simule un reçu pour cohérence
+                    return {
+                        transactionHash: 'auto-distributed-when-other-party-withdrew',
+                        blockNumber: channel.closingBlock || 'unknown',
+                        status: 'funds-already-distributed',
+                        userFinalBalance: userFinalBalance.toString(),
+                        message: 'Funds were automatically distributed when the other party withdrew'
+                    };
+                } else {
+                    console.log(`\n📊 No funds to withdraw (your final balance is 0 THD)`);
+
+                    return {
+                        transactionHash: 'no-funds-to-withdraw',
+                        blockNumber: channel.closingBlock || 'unknown',
+                        status: 'no-funds',
+                        userFinalBalance: '0',
+                        message: 'No funds to withdraw - your final balance is 0 THD'
+                    };
+                }
+            }
+
             if (channel.state !== 'CLOSING') {
                 throw new Error(`Channel not in closing state. Current state: ${channel.state}`);
             }
 
-            // === CORRECTION BIGINT: Conversions explicites ===
+            // === LOGIQUE ORIGINALE POUR ÉTAT CLOSING ===
 
             // Vérifie si la période de challenge est passée
             const currentBlock = await this.blockchain.web3.eth.getBlockNumber();
             const challengePeriod = 24;
 
-            // APRÈS (corrigé): tout en Number
             const currentBlockNum = Number(currentBlock);
             const closingBlockNum = Number(channel.closingBlock);
             const challengeEndBlock = closingBlockNum + challengePeriod;
@@ -715,88 +758,59 @@ class ChannelManager {
 
             console.log(`💳 Withdrawing from channel ${Utils.formatAddress(channel.address)}`);
 
-            // === DEBUG DÉTAILLÉ AVEC CONVERSIONS CORRECTES ===
-
+            // === VÉRIFICATION D'ÉTAT BLOCKCHAIN ===
             console.log(`🔍 Pre-withdraw diagnostics:`);
 
-            // 1. État du contract
             const contractInfo = await channel.contract.methods.getChannelInfo().call();
             const contractState = this.mapContractState(contractInfo._state);
 
             console.log(`   Contract state: ${contractState}`);
             console.log(`   Contract balanceA: ${Utils.formatBalance(BigInt(contractInfo._balanceA))}`);
             console.log(`   Contract balanceB: ${Utils.formatBalance(BigInt(contractInfo._balanceB))}`);
-            console.log(`   Contract nonce: ${contractInfo._nonce}`);
-            console.log(`   Contract closing block: ${contractInfo._closingBlock}`);
 
-            // 2. Vérification de l'état
+            // === NOUVELLE VÉRIFICATION: Si le contrat est CLOSED ===
+            if (contractState === 'CLOSED') {
+                console.log(`🎉 Contract is already CLOSED - funds were distributed!`);
+
+                // Met à jour l'état local
+                channel.state = 'CLOSED';
+                channel.balanceA = BigInt(contractInfo._balanceA);
+                channel.balanceB = BigInt(contractInfo._balanceB);
+                channel.lastUpdate = new Date().toISOString();
+
+                // Calcule ce que l'utilisateur a reçu
+                const currentUserAddress = this.blockchain.currentAccount.address.toLowerCase();
+                const isPartA = currentUserAddress === channel.partA.toLowerCase();
+                const userFinalBalance = isPartA ? channel.balanceA : channel.balanceB;
+
+                console.log(`💰 Your final balance: ${Utils.formatBalance(userFinalBalance)} THD`);
+                console.log(`   These funds should already be in your wallet`);
+                console.log(`   The other party withdrew first, which triggered automatic distribution`);
+
+                // Simule le reçu
+                return {
+                    transactionHash: 'auto-distributed-by-other-party-withdraw',
+                    blockNumber: contractInfo._closingBlock,
+                    status: 'already-distributed',
+                    userFinalBalance: userFinalBalance.toString(),
+                    message: 'Funds were automatically distributed when the other party withdrew'
+                };
+            }
+
+            // === LOGIQUE ORIGINALE POUR CLOSING ===
             if (contractState !== 'CLOSING') {
                 throw new Error(`Contract not in CLOSING state. Current: ${contractState}`);
             }
 
-            // 3. Vérification du challenge period côté contract
-            const contractClosingBlock = Number(contractInfo._closingBlock);
-            const contractChallengeEnd = contractClosingBlock + challengePeriod;
-
-            if (currentBlockNum <= contractChallengeEnd) {
-                const remaining = contractChallengeEnd - currentBlockNum;
-                throw new Error(`Contract challenge period not expired. ${remaining} blocks remaining.`);
-            }
-
-            // 4. Balance THD du contract
-            const thdAbi = require('../../artifacts/contracts/THDToken.sol/THDToken.json').abi;
-            const thdContract = new this.blockchain.web3.eth.Contract(
-                thdAbi,
-                this.blockchain.deploymentInfo.thdToken
-            );
-
-            const contractThdBalance = await thdContract.methods.balanceOf(channel.address).call();
-            console.log(`   Contract THD balance: ${Utils.formatBalance(BigInt(contractThdBalance))}`);
-
-            // Calcul avec BigInt
-            const expectedBalanceA = BigInt(contractInfo._balanceA);
-            const expectedBalanceB = BigInt(contractInfo._balanceB);
-            const expectedTotal = expectedBalanceA + expectedBalanceB;
-            const actualBalance = BigInt(contractThdBalance);
-
-            console.log(`   Expected total: ${Utils.formatBalance(expectedTotal)}`);
-            console.log(`   Actual balance: ${Utils.formatBalance(actualBalance)}`);
-
-            if (actualBalance < expectedTotal) {
-                console.error(`❌ Contract doesn't have enough THD tokens!`);
-                console.error(`   Has: ${Utils.formatBalance(actualBalance)}`);
-                console.error(`   Needs: ${Utils.formatBalance(expectedTotal)}`);
-                throw new Error('Insufficient THD balance in contract');
-            }
-
-            // 5. Estimation de gas avec debug
+            // Estimation de gas
             console.log(`⛽ Estimating gas...`);
-            let gasEstimate;
-            try {
-                gasEstimate = await channel.contract.methods.withdraw().estimateGas({
-                    from: this.blockchain.currentAccount.address
-                });
-                console.log(`   Gas estimate: ${gasEstimate}`);
-            } catch (gasError) {
-                console.error(`❌ Gas estimation failed:`, gasError.message);
-                console.error(`   This usually means the contract will revert`);
+            const gasEstimate = await channel.contract.methods.withdraw().estimateGas({
+                from: this.blockchain.currentAccount.address
+            });
 
-                // Diagnostics spécifiques
-                if (contractInfo._state !== '2') {
-                    console.error(`   Issue: Contract state is ${contractInfo._state}, expected 2 (CLOSING)`);
-                }
-
-                const blockDiff = currentBlockNum - contractClosingBlock;
-                if (blockDiff <= challengePeriod) {
-                    console.error(`   Issue: Challenge period (${blockDiff}/${challengePeriod} blocks)`);
-                }
-
-                throw new Error(`Withdraw will fail: ${gasError.message}`);
-            }
-
-            // 6. Transaction avec gas majoré (conversion en Number)
+            // Transaction
             const gasToUse = Math.floor(Number(gasEstimate) * 1.5);
-            console.log(`📤 Executing withdraw with gas: ${gasToUse} (estimate: ${gasEstimate})`);
+            console.log(`📤 Executing withdraw with gas: ${gasToUse}`);
 
             const receipt = await channel.contract.methods.withdraw().send({
                 from: this.blockchain.currentAccount.address,
@@ -809,21 +823,15 @@ class ChannelManager {
 
             console.log(`✅ Withdraw successful!`);
             console.log(`   Transaction: ${receipt.transactionHash}`);
-            console.log(`   Gas used: ${receipt.gasUsed}/${gasToUse}`);
             console.log(`   Channel state: CLOSED`);
 
-            // Affiche les montants retirés
-            const currentUserAddress = this.blockchain.currentAccount.address.toLowerCase();
-            const isPartA = currentUserAddress === channel.partA.toLowerCase();
-            const userFinalBalance = isPartA ? expectedBalanceA : expectedBalanceB;
-
-            console.log(`💰 Your withdrawal: ${Utils.formatBalance(userFinalBalance)} THD`);
-
-            // === CORRECTION CRITIQUE: NOTIFICATION P2P DU WITHDRAW ===
-            console.log(`\n📡 Starting P2P withdraw notification...`);
-
+            // === NOTIFICATION P2P ===
             if (this.p2pManager) {
                 try {
+                    const currentUserAddress = this.blockchain.currentAccount.address.toLowerCase();
+                    const isPartA = currentUserAddress === channel.partA.toLowerCase();
+                    const userFinalBalance = isPartA ? channel.balanceA : channel.balanceB;
+
                     const withdrawNotification = {
                         channelId: channel.id,
                         channelAddress: channel.address,
@@ -833,77 +841,43 @@ class ChannelManager {
                         transactionHash: receipt.transactionHash,
                         blockNumber: receipt.blockNumber,
                         timestamp: new Date().toISOString(),
-                        // Informations complètes pour synchronisation
                         partA: channel.partA,
                         partB: channel.partB,
-                        finalBalanceA: expectedBalanceA.toString(),
-                        finalBalanceB: expectedBalanceB.toString(),
+                        finalBalanceA: channel.balanceA.toString(),
+                        finalBalanceB: channel.balanceB.toString(),
                         channelNowClosed: true
                     };
 
                     console.log(`📤 Broadcasting CHANNEL_WITHDRAWN message...`);
-                    console.log(`   Withdrawn by: ${Utils.formatAddress(currentUserAddress)}`);
-                    console.log(`   Role: ${isPartA ? 'Part A' : 'Part B'}`);
-                    console.log(`   Amount: ${Utils.formatBalance(userFinalBalance)} THD`);
-
-                    const broadcastResults = await this.p2pManager.broadcastMessage('CHANNEL_WITHDRAWN', withdrawNotification);
-
-                    const successCount = broadcastResults.filter(r => r.success).length;
-                    const totalCount = broadcastResults.length;
-                    console.log(`📤 P2P Withdraw notification complete: ${successCount}/${totalCount} peers notified`);
-
-                    if (successCount > 0) {
-                        console.log(`✅ Peers notified that channel is now CLOSED`);
-                        console.log(`   Other participants can now withdraw their funds`);
-                    } else if (totalCount === 0) {
-                        console.log(`ℹ️  No peers connected for notification`);
-                    } else {
-                        console.log(`⚠️  Some peers failed to receive withdraw notification`);
-                    }
+                    await this.p2pManager.broadcastMessage('CHANNEL_WITHDRAWN', withdrawNotification);
+                    console.log(`✅ Peers notified of withdrawal`);
 
                 } catch (p2pError) {
                     console.error(`❌ P2P withdraw notification failed:`, p2pError.message);
-                    console.error(`   Withdraw was successful but peer notification failed`);
-                    console.error(`   Other participants should check channel status manually`);
                 }
-            } else {
-                console.log(`⚠️  P2P Manager not available for withdraw notification`);
-                console.log(`   Other participants won't be notified automatically`);
             }
-
-            console.log(`\n💡 Withdraw summary:`);
-            console.log(`   ✅ Blockchain transaction: SUCCESS`);
-            console.log(`   📡 P2P notification: ${this.p2pManager ? 'ATTEMPTED' : 'SKIPPED'}`);
-            console.log(`   🔒 Channel state: CLOSED`);
-            console.log(`   💰 Amount withdrawn: ${Utils.formatBalance(userFinalBalance)} THD`);
 
             return receipt;
 
         } catch (error) {
             console.error('❌ Withdraw failed:', error.message);
-            console.error('Full error:', error);
 
-            // Debug spécifique pour les erreurs BigInt
-            if (error.message.includes('BigInt')) {
-                console.error('🔍 BigInt conversion error detected');
-                console.error('   Check that all numeric operations use explicit conversions');
-                console.error('   Use Number() for small numbers and BigInt() for token amounts');
-            }
-
-            // Debug pour les erreurs contract
-            if (error.message.includes('smart contract')) {
-                console.error('🔍 Smart contract error detected - possible causes:');
-                console.error('   1. Contract state not CLOSING');
-                console.error('   2. Challenge period not expired');
-                console.error('   3. Insufficient gas');
-                console.error('   4. Token transfer failed');
-                console.error('   5. Reentrancy or other contract logic issue');
+            // Messages d'erreur améliorés
+            if (error.message.includes('already CLOSED')) {
+                console.error('');
+                console.error('💡 The channel is already closed and funds distributed.');
+                console.error('   This happens when the other party withdrew first.');
+                console.error('   Your funds should already be in your wallet.');
+                console.error('');
+                console.error('🎯 What to do now:');
+                console.error('   1. Check your balance: thunder-cli balance');
+                console.error('   2. Your THD tokens should be visible there');
+                console.error('   3. The channel closure was successful');
             }
 
             throw error;
         }
     }
-
     /**
      * Calcule les balances d'un utilisateur (THD lockés + balance dans les channels)
      * @param {string} userAddress - Adresse de l'utilisateur
